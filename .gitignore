@@ -1,0 +1,17 @@
+﻿# Runtime/local secrets
+.env
+app/.env
+
+# Generated guide projects and temporary files
+storage/artworks/
+storage/tmp/
+
+# Dependency folders and logs
+node_modules/
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc

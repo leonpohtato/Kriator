@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Krita Guide Agent</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <section class="topbar">
+      <div>
+        <h1>Krita Guide Agent</h1>
+        <p id="healthLine">Checking local server...</p>
+      </div>
+      <a class="link-button" href="/api/health" target="_blank" rel="noreferrer">Health</a>
+    </section>
+
+    <section class="workspace">
+      <aside class="side-panel">
+        <label class="dropzone" id="dropzone">
+          <input id="fileInput" type="file" accept=".png,.jpg,.jpeg,.webp,.clip,image/png,image/jpeg,image/webp">
+          <span class="drop-title">Choose artwork</span>
+          <span class="drop-meta">PNG, JPG, WEBP, or CLIP</span>
+        </label>
+
+        <div class="field">
+          <label for="guideMode">Guide mode</label>
+          <select id="guideMode">
+            <option value="overlay-heavy" selected>Overlay-heavy</option>
+            <option value="balanced">Balanced</option>
+            <option value="text-first">Text-first</option>
+          </select>
+        </div>
+
+        <label class="check-row">
+          <input id="localOnly" type="checkbox">
+          <span>Local-only fallback</span>
+        </label>
+
+        <button id="uploadBtn" class="primary" disabled>Upload</button>
+        <button id="generateBtn" disabled>Generate guide</button>
+        <button id="openKritaBtn" disabled>Open Krita</button>
+
+        <div class="status-box" id="statusBox">No artwork selected.</div>
+
+        <div class="history-head">
+          <h2>Recent</h2>
+          <button id="refreshBtn" class="small">Refresh</button>
+        </div>
+        <div id="historyList" class="history-list"></div>
+      </aside>
+
+      <section class="main-panel">
+        <div class="preview-band">
+          <div class="preview-frame">
+            <img id="previewImage" alt="Artwork preview">
+            <span id="previewEmpty">Upload an artwork to begin.</span>
+          </div>
+          <div class="meta-grid" id="metaGrid">
+            <div><strong>Project</strong><span>None</span></div>
+            <div><strong>Status</strong><span>Idle</span></div>
+            <div><strong>Steps</strong><span>0</span></div>
+            <div><strong>Storage</strong><span>D:\data</span></div>
+          </div>
+        </div>
+
+        <nav class="tabs" aria-label="Output tabs">
+          <button class="tab active" data-tab="steps">Steps</button>
+          <button class="tab" data-tab="overlays">Overlays</button>
+          <button class="tab" data-tab="krita">Krita</button>
+          <button class="tab" data-tab="storage">Storage</button>
+          <button class="tab" data-tab="download">Download</button>
+        </nav>
+
+        <section id="tab-steps" class="tab-panel active">
+          <div id="stepsOutput" class="empty-output">Step cards will appear here after generation.</div>
+        </section>
+        <section id="tab-overlays" class="tab-panel">
+          <div id="overlaysOutput" class="empty-output">Overlay PNGs will appear here after generation.</div>
+        </section>
+        <section id="tab-krita" class="tab-panel">
+          <div id="kritaOutput" class="empty-output">Krita helper details will appear here after generation.</div>
+        </section>
+        <section id="tab-storage" class="tab-panel">
+          <div id="storageOutput" class="empty-output">Storage details will appear here.</div>
+        </section>
+        <section id="tab-download" class="tab-panel">
+          <div id="downloadOutput" class="empty-output">Download link will appear here after generation.</div>
+        </section>
+      </section>
+    </section>
+  </main>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

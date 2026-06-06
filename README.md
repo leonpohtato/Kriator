@@ -1,0 +1,55 @@
+# Krita Guide Agent
+
+Local MVP for turning an uploaded artwork into a beginner Krita guide pack.
+
+## Run
+
+```powershell
+cd /d D:\data\krita-guide-agent\app
+npm start
+```
+
+Then open:
+
+```text
+http://localhost:8788
+```
+
+## Configure OpenAI
+
+Copy `app\.env.example` to `app\.env` or `D:\data\krita-guide-agent\.env`, then set:
+
+```text
+OPENAI_API_KEY=your_key_here
+OPENAI_MODEL=gpt-5.4-mini
+```
+
+If no key is set, the app still generates a local heuristic guide and marks it with a warning.
+
+## Outputs
+
+Generated projects are stored under:
+
+```text
+D:\data\krita-guide-agent\storage\artworks\<artwork-id>
+```
+
+Each project includes:
+
+- `reference.png`
+- `guide.json`
+- `README.md`
+- `palette.gpl`
+- `overlays\step_*.png`
+- `steps\step_*_card.png`
+- `krita\guide_loader.py`
+
+## Krita
+
+Krita path defaults to:
+
+```text
+C:\Program Files\Krita (x64)\bin\krita.exe
+```
+
+Set `KRITA_PATH` in `.env` if your Krita install moves. The generated `krita\guide_loader.py` can be run from Krita's Scripter. If automatic file layers fail, manually import `reference.png` and the overlay PNGs.
