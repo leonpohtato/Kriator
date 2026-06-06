@@ -6,9 +6,10 @@ import time
 import urllib.request
 
 from krita import DockWidget, DockWidgetFactory, DockWidgetFactoryBase, InfoObject, Krita
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QEvent, QTimer, Qt
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
+    QApplication,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -26,6 +27,16 @@ from PyQt5.QtWidgets import (
 APP_URL = os.environ.get("KRITA_GUIDE_AGENT_URL", "http://localhost:8788")
 OVERLAY_NAME = "KGA Live Overlay - do not draw here"
 SESSION_ID = "krita-live"
+TABLET_EVENTS = {
+    int(QEvent.TabletPress): "tablet_press",
+    int(QEvent.TabletMove): "tablet_move",
+    int(QEvent.TabletRelease): "tablet_release",
+}
+MOUSE_EVENTS = {
+    int(QEvent.MouseButtonPress): "mouse_press",
+    int(QEvent.MouseMove): "mouse_move",
+    int(QEvent.MouseButtonRelease): "mouse_release",
+}
 
 
 class KritaGuideLiveDocker(DockWidget):
@@ -37,6 +48,9 @@ class KritaGuideLiveDocker(DockWidget):
         self.last_overlay_path = ""
         self.focus_step = None
         self.segment_results = []
+        self.input_events = []
+        self.input_event_limit = 1200
+        self.last_input_summary = {}
         self.busy = False
 
         root = QWidget()
@@ -69,9 +83,12 @@ class KritaGuideLiveDocker(DockWidget):
         self.auto_advance.setChecked(True)
         self.visual_compare = QCheckBox("Visual compare")
         self.visual_compare.setChecked(True)
+        self.record_input = QCheckBox("Record input metrics")
+        self.record_input.setChecked(True)
         row2.addWidget(self.auto_overlay)
         row2.addWidget(self.auto_advance)
         row2.addWidget(self.visual_compare)
+        row2.addWidget(self.record_input)
         layout.addLayout(row2)
 
         row3 = QHBoxLayout()
@@ -87,6 +104,10 @@ class KritaGuideLiveDocker(DockWidget):
         self.step_label = QLabel("Step: -")
         self.step_label.setWordWrap(True)
         layout.addWidget(self.step_label)
+
+        self.telemetry_label = QLabel("Input telemetry: waiting for live session.")
+        self.telemetry_label.setWordWrap(True)
+        layout.addWidget(self.telemetry_label)
 
         self.visual_label = QLabel("Visual comparison appears after analysis.")
         self.visual_label.setWordWrap(True)
@@ -119,11 +140,28 @@ class KritaGuideLiveDocker(DockWidget):
         self.once_btn.clicked.connect(self.analyze_now)
         self.follow_btn.clicked.connect(self.follow_detected)
         self.make_layers_btn.clicked.connect(self.make_work_layers)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def canvasChanged(self, canvas):
         pass
 
+    def eventFilter(self, obj, event):
+        try:
+            if self.timer.isActive() and self.record_input.isChecked():
+                event_type = int(event.type())
+                if event_type in TABLET_EVENTS:
+                    self.capture_tablet_event(event, TABLET_EVENTS[event_type])
+                elif event_type in MOUSE_EVENTS:
+                    self.capture_mouse_event(event, MOUSE_EVENTS[event_type])
+        except Exception:
+            pass
+        return False
+
     def start_live(self):
+        self.input_events = []
+        self.last_input_summary = {}
         self.timer.start(self.interval.value() * 1000)
         self.status.setText("Live monitoring is running. The coach hides its overlay before each capture.")
         self.analyze_now()
@@ -183,10 +221,12 @@ class KritaGuideLiveDocker(DockWidget):
     def post_snapshot(self, snapshot_path):
         with open(snapshot_path, "rb") as handle:
             encoded = base64.b64encode(handle.read()).decode("ascii")
+        telemetry = self.drain_input_telemetry()
         payload = {
             "sessionId": SESSION_ID,
             "projectId": self.project_input.text().strip(),
             "focusStep": self.focus_step,
+            "telemetry": telemetry,
             "snapshotDataUrl": "data:image/png;base64," + encoded,
             "timestamp": time.time(),
         }
@@ -255,6 +295,7 @@ class KritaGuideLiveDocker(DockWidget):
             "Common mistake: " + str(result.get("commonMistake", "")),
         ]
         self.feedback.setPlainText("\n".join(details))
+        self.update_telemetry_label(result)
         self.update_visual_preview(result)
         if self.auto_overlay.isChecked():
             overlay = result.get("liveOverlayPath") or result.get("overlayPath")
@@ -278,6 +319,142 @@ class KritaGuideLiveDocker(DockWidget):
         width = max(260, self.visual_label.width() - 12)
         scaled = pixmap.scaled(width, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.visual_label.setPixmap(scaled)
+
+    def update_telemetry_label(self, result):
+        summary = self.last_input_summary or {}
+        pressure_count = summary.get("pressureSamples", 0)
+        if not self.record_input.isChecked():
+            self.telemetry_label.setText("Input telemetry: off.")
+            return
+        text = "Input telemetry: {0} events, {1}px movement".format(
+            summary.get("eventCount", 0),
+            round(summary.get("distancePx", 0), 1),
+        )
+        if pressure_count:
+            text += ", pressure avg {0} max {1}".format(
+                round(summary.get("avgPressure", 0), 3),
+                round(summary.get("maxPressure", 0), 3),
+            )
+        else:
+            text += ", pressure not exposed this interval"
+        if result.get("telemetryStored"):
+            text += ". Stored."
+        self.telemetry_label.setText(text)
+
+    def capture_tablet_event(self, event, name):
+        pos = self.event_position(event)
+        item = {
+            "t": time.time(),
+            "kind": name,
+            "source": "tablet",
+            "x": pos[0],
+            "y": pos[1],
+            "pressure": self.event_number(event, "pressure"),
+            "xTilt": self.event_number(event, "xTilt"),
+            "yTilt": self.event_number(event, "yTilt"),
+            "rotation": self.event_number(event, "rotation"),
+            "tangentialPressure": self.event_number(event, "tangentialPressure"),
+            "button": self.enum_int(self.event_value(event, "button")),
+            "buttons": self.enum_int(self.event_value(event, "buttons")),
+            "pointerType": self.enum_int(self.event_value(event, "pointerType")),
+            "device": self.enum_int(self.event_value(event, "device")),
+        }
+        self.append_input_event(item)
+
+    def capture_mouse_event(self, event, name):
+        button = self.enum_int(self.event_value(event, "button"))
+        buttons = self.enum_int(self.event_value(event, "buttons"))
+        if name == "mouse_move" and not buttons:
+            return
+        pos = self.event_position(event)
+        self.append_input_event({
+            "t": time.time(),
+            "kind": name,
+            "source": "mouse",
+            "x": pos[0],
+            "y": pos[1],
+            "button": button,
+            "buttons": buttons,
+        })
+
+    def append_input_event(self, item):
+        self.input_events.append(item)
+        if len(self.input_events) > self.input_event_limit:
+            self.input_events = self.input_events[-self.input_event_limit:]
+
+    def drain_input_telemetry(self):
+        events = self.input_events
+        self.input_events = []
+        summary = self.summarize_input_events(events)
+        self.last_input_summary = summary
+        return {
+            "schema": "kriator-live-input-v1",
+            "events": events,
+            "summary": summary,
+        }
+
+    def summarize_input_events(self, events):
+        pressure_values = [
+            float(item["pressure"]) for item in events
+            if item.get("pressure") is not None and float(item.get("pressure", 0)) > 0
+        ]
+        distance = 0.0
+        previous = None
+        for item in events:
+            x = item.get("x")
+            y = item.get("y")
+            if x is None or y is None:
+                continue
+            if previous is not None:
+                dx = float(x) - float(previous[0])
+                dy = float(y) - float(previous[1])
+                distance += (dx * dx + dy * dy) ** 0.5
+            previous = (x, y)
+        tablet_count = len([item for item in events if item.get("source") == "tablet"])
+        return {
+            "eventCount": len(events),
+            "tabletEvents": tablet_count,
+            "mouseEvents": len(events) - tablet_count,
+            "pressureSamples": len(pressure_values),
+            "avgPressure": sum(pressure_values) / len(pressure_values) if pressure_values else 0,
+            "maxPressure": max(pressure_values) if pressure_values else 0,
+            "distancePx": distance,
+            "durationMs": int((events[-1]["t"] - events[0]["t"]) * 1000) if len(events) >= 2 else 0,
+        }
+
+    def event_position(self, event):
+        for name in ("posF", "pos", "globalPosF", "globalPos"):
+            value = self.event_value(event, name)
+            if value is not None:
+                try:
+                    return [float(value.x()), float(value.y())]
+                except Exception:
+                    pass
+        x = self.event_number(event, "x")
+        y = self.event_number(event, "y")
+        return [x, y]
+
+    def event_number(self, event, name):
+        value = self.event_value(event, name)
+        try:
+            return float(value) if value is not None else None
+        except Exception:
+            return None
+
+    def event_value(self, event, name):
+        attr = getattr(event, name, None)
+        if attr is None:
+            return None
+        try:
+            return attr() if callable(attr) else attr
+        except Exception:
+            return None
+
+    def enum_int(self, value):
+        try:
+            return int(value)
+        except Exception:
+            return None
 
     def render_segment_buttons(self):
         while self.segment_layout.count():

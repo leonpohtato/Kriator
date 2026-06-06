@@ -86,3 +86,18 @@ The docker captures the active document every few seconds, hides its own overlay
 The segment list shows clickable comments for likely matching sections. Click a segment to lock focus there while you keep tweaking it; the comments and overlay keep updating for that same section. Press `Follow detected` to return to automatic section following.
 
 The docker also has a `Visual compare` mode. For the selected segment it shows a side-by-side preview: the matching reference section on the left and your current drawing crop on the right. During lineart-only captures, flat-color, shadow, highlight, and detail steps are not counted as complete just because an outline crosses that region.
+
+## Live Input Telemetry
+
+The live coach records a beginner drawing session as JSONL under:
+
+```text
+D:\data\krita-guide-agent\storage\artworks\<artwork-id>\live_sessions\<session-id>.jsonl
+```
+
+Each record stores the current guide step, stage detection, feedback summary, visual-snapshot metrics, and app-wide tablet/mouse events that Krita/PyQt exposes during that interval. Pressure, tilt, and rotation are saved when the tablet event provides them. If Krita does not expose pressure for that event stream, the record explicitly shows `pressureAvailable: false` instead of guessing.
+
+Useful endpoints:
+
+- `GET /api/artworks/<artwork-id>/live-sessions`
+- `GET /api/artworks/<artwork-id>/live-sessions/<session-id>`

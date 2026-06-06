@@ -120,6 +120,16 @@ async function handle(req, res) {
     return openKrita(res, openKritaMatch[1]);
   }
 
+  const liveSessionsMatch = url.pathname.match(/^\/api\/artworks\/([^/]+)\/live-sessions$/);
+  if (method === "GET" && liveSessionsMatch) {
+    return listLiveSessions(res, liveSessionsMatch[1]);
+  }
+
+  const liveSessionMatch = url.pathname.match(/^\/api\/artworks\/([^/]+)\/live-sessions\/([^/]+)$/);
+  if (method === "GET" && liveSessionMatch) {
+    return readLiveSession(res, liveSessionMatch[1], liveSessionMatch[2]);
+  }
+
   const artworkMatch = url.pathname.match(/^\/api\/artworks\/([^/]+)$/);
   if (method === "GET" && artworkMatch) {
     return sendJson(res, 200, { ok: true, artwork: await loadArtworkState(artworkMatch[1]) });
@@ -195,6 +205,7 @@ async function liveFeedback(res, body) {
   if (projectId) assertArtworkId(projectId);
   const focusStep = Number.isFinite(Number(body.focusStep)) ? String(Math.max(1, Math.floor(Number(body.focusStep)))) : "";
   const sessionId = String(body.sessionId || "krita-live").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  const telemetry = normalizeTelemetry(body.telemetry);
   await fsp.mkdir(TMP_ROOT, { recursive: true });
   const snapshotPath = path.join(TMP_ROOT, `${sessionId}-${Date.now()}.png`);
   await fsp.writeFile(snapshotPath, Buffer.from(match[1], "base64"));
@@ -204,10 +215,143 @@ async function liveFeedback(res, body) {
     if (focusStep) args.push(focusStep);
     const result = await runWorker(args, { timeoutMs: 120000 });
     const feedback = parseJsonMaybe(result.stdout);
+    const stored = await appendLiveSessionRecord(feedback.projectId || projectId, sessionId, {
+      timestamp: new Date().toISOString(),
+      receivedAtMs: Date.now(),
+      focusStep: focusStep ? Number(focusStep) : null,
+      telemetry,
+      feedback: summarizeFeedback(feedback)
+    });
+    feedback.telemetryStored = stored;
+    feedback.telemetrySummary = telemetry.summary;
     return sendJson(res, 200, { ok: true, feedback });
   } finally {
     fsp.rm(snapshotPath, { force: true }).catch(() => {});
   }
+}
+
+async function appendLiveSessionRecord(projectId, sessionId, record) {
+  if (!projectId) return false;
+  assertArtworkId(projectId);
+  const safeSession = sanitizeSessionId(sessionId);
+  const dir = path.join(artworkDir(projectId), "live_sessions");
+  await fsp.mkdir(dir, { recursive: true });
+  await fsp.appendFile(path.join(dir, `${safeSession}.jsonl`), `${JSON.stringify(record)}\n`, "utf-8");
+  return true;
+}
+
+function normalizeTelemetry(input) {
+  const source = input && typeof input === "object" ? input : {};
+  const rawEvents = Array.isArray(source.events) ? source.events.slice(-1200) : [];
+  const events = rawEvents.map((item) => {
+    const event = item && typeof item === "object" ? item : {};
+    return {
+      t: finiteNumber(event.t),
+      kind: safeSmallString(event.kind, 40),
+      source: safeSmallString(event.source, 20),
+      x: finiteNumber(event.x),
+      y: finiteNumber(event.y),
+      pressure: finiteNumber(event.pressure),
+      xTilt: finiteNumber(event.xTilt),
+      yTilt: finiteNumber(event.yTilt),
+      rotation: finiteNumber(event.rotation),
+      tangentialPressure: finiteNumber(event.tangentialPressure),
+      button: finiteNumber(event.button),
+      buttons: finiteNumber(event.buttons),
+      pointerType: finiteNumber(event.pointerType),
+      device: finiteNumber(event.device)
+    };
+  });
+  return {
+    schema: safeSmallString(source.schema, 80) || "kriator-live-input-v1",
+    summary: summarizeTelemetry(events, source.summary),
+    events
+  };
+}
+
+function summarizeTelemetry(events, clientSummary = {}) {
+  const pressures = events.map((event) => event.pressure).filter((value) => Number.isFinite(value) && value > 0);
+  let distance = 0;
+  let previous = null;
+  for (const event of events) {
+    if (!Number.isFinite(event.x) || !Number.isFinite(event.y)) continue;
+    if (previous) {
+      const dx = event.x - previous.x;
+      const dy = event.y - previous.y;
+      distance += Math.sqrt(dx * dx + dy * dy);
+    }
+    previous = event;
+  }
+  const tabletEvents = events.filter((event) => event.source === "tablet").length;
+  return {
+    eventCount: events.length,
+    tabletEvents,
+    mouseEvents: events.length - tabletEvents,
+    pressureSamples: pressures.length,
+    avgPressure: pressures.length ? pressures.reduce((sum, value) => sum + value, 0) / pressures.length : 0,
+    maxPressure: pressures.length ? Math.max(...pressures) : 0,
+    distancePx: distance,
+    durationMs: Number.isFinite(Number(clientSummary.durationMs)) ? Number(clientSummary.durationMs) : 0,
+    pressureAvailable: pressures.length > 0
+  };
+}
+
+function summarizeFeedback(feedback) {
+  return {
+    status: feedback.status,
+    projectId: feedback.projectId,
+    step: feedback.step,
+    stepTitle: feedback.stepTitle,
+    progressPercent: feedback.progressPercent,
+    recommendedStep: feedback.recommendedStep,
+    stageInfo: feedback.stageInfo || {},
+    segmentCount: Array.isArray(feedback.segments) ? feedback.segments.length : 0,
+    comments: Array.isArray(feedback.comments) ? feedback.comments.slice(0, 5) : []
+  };
+}
+
+async function listLiveSessions(res, id) {
+  assertArtworkId(id);
+  const dir = path.join(artworkDir(id), "live_sessions");
+  if (!fs.existsSync(dir)) return sendJson(res, 200, { ok: true, sessions: [] });
+  const files = await fsp.readdir(dir);
+  const sessions = [];
+  for (const file of files) {
+    if (!file.endsWith(".jsonl")) continue;
+    const fullPath = path.join(dir, file);
+    const stat = await fsp.stat(fullPath);
+    sessions.push({
+      sessionId: file.replace(/\.jsonl$/, ""),
+      bytes: stat.size,
+      updatedAt: stat.mtime.toISOString(),
+      path: fullPath
+    });
+  }
+  sessions.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  sendJson(res, 200, { ok: true, sessions });
+}
+
+async function readLiveSession(res, id, sessionId) {
+  assertArtworkId(id);
+  const safeSession = sanitizeSessionId(sessionId);
+  const file = path.join(artworkDir(id), "live_sessions", `${safeSession}.jsonl`);
+  if (!fs.existsSync(file)) return sendJson(res, 404, { ok: false, error: "Live session not found." });
+  const text = await fsp.readFile(file, "utf-8");
+  const records = text.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  sendJson(res, 200, { ok: true, sessionId: safeSession, records });
+}
+
+function sanitizeSessionId(value) {
+  return String(value || "krita-live").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "krita-live";
+}
+
+function safeSmallString(value, limit) {
+  return String(value || "").replace(/[^\w:.-]/g, "_").slice(0, limit);
+}
+
+function finiteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 async function generateArtwork(res, id, body) {
