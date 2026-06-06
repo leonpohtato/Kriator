@@ -41,9 +41,10 @@ def main():
             fail("usage: zip <artwork_dir> <zip_path>")
         result = zip_artwork(Path(sys.argv[2]), Path(sys.argv[3]))
     elif command == "live-feedback":
-        if len(sys.argv) != 5:
-            fail("usage: live-feedback <artworks_root> <snapshot_path> <project_id_or_empty>")
-        result = live_feedback(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])
+        if len(sys.argv) not in (5, 6):
+            fail("usage: live-feedback <artworks_root> <snapshot_path> <project_id_or_empty> [focus_step]")
+        focus_step = int(sys.argv[5]) if len(sys.argv) == 6 and str(sys.argv[5]).strip() else None
+        result = live_feedback(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], focus_step)
     else:
         fail(f"unknown command: {command}")
     print(json.dumps(result, ensure_ascii=True))
@@ -664,7 +665,7 @@ def zip_artwork(art_dir, zip_path):
     return {"zip": str(zip_path), "bytes": zip_path.stat().st_size}
 
 
-def live_feedback(artworks_root, snapshot_path, project_id):
+def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None):
     project = find_live_project(artworks_root, project_id)
     if not project:
         return {
@@ -683,7 +684,7 @@ def live_feedback(artworks_root, snapshot_path, project_id):
 
     guide = json.loads(guide_path.read_text(encoding="utf-8"))
     analysis = json.loads(analysis_path.read_text(encoding="utf-8")) if analysis_path.exists() else {}
-    snapshot = Image.open(snapshot_path).convert("RGB")
+    snapshot = flatten_for_live(Image.open(snapshot_path))
     reference = Image.open(reference_path).convert("RGB")
     if snapshot.size != reference.size:
         snapshot = snapshot.resize(reference.size, Image.LANCZOS)
@@ -698,32 +699,194 @@ def live_feedback(artworks_root, snapshot_path, project_id):
     ref_mask = clean_mask(ref_mask)
 
     active_bbox = bbox_from_mask(snap_mask, reference.width, reference.height, pad=8)
+    ref_bbox = analysis.get("fullBbox") or bbox_from_mask(ref_mask, reference.width, reference.height, pad=8)
     total_drawn = int(snap_mask.sum())
     if total_drawn < 80:
         step = guide["steps"][0]
-        return build_live_response(project, guide, step, 0.0, active_bbox, "Start with the first guide step. Your canvas is still almost blank.", [])
+        return build_live_response(project, guide, step, 0.0, active_bbox, "Start with the first guide step. Your canvas is still almost blank.", [], segments=[])
 
+    mapped_user_mask = map_mask_to_reference(snap_mask, active_bbox, ref_bbox, reference.width, reference.height)
+    mapped_active_bbox = bbox_from_mask(mapped_user_mask, reference.width, reference.height, pad=8)
+    mapped_area_ratio = (mapped_active_bbox["w"] * mapped_active_bbox["h"]) / max(1, ref_bbox["w"] * ref_bbox["h"])
+    live_overlay_dir = project / "live_overlays"
+    live_overlay_dir.mkdir(exist_ok=True)
     scored = []
     for step in guide.get("steps", []):
+        step_number = int(step.get("step", 1))
+        if is_live_prep_step(step):
+            continue
         region = clamp_rect_dict(step.get("region", guide.get("canvas", {})), reference.width, reference.height)
         x, y, w, h = region["x"], region["y"], region["w"], region["h"]
-        snap_region = snap_mask[y:y + h, x:x + w]
+        snap_region = mapped_user_mask[y:y + h, x:x + w]
         ref_region = ref_mask[y:y + h, x:x + w]
         drawn_in_region = int(snap_region.sum())
         ref_in_region = int(ref_region.sum())
         density = drawn_in_region / max(1, w * h)
         progress = drawn_in_region / max(1, ref_in_region)
         overlap = int(np.logical_and(snap_region, ref_region).sum()) / max(1, drawn_in_region)
-        # Favor the area the user is actively drawing, then progress against reference structure.
-        score = density * 3.0 + min(progress, 1.4) * 0.55 + overlap * 0.35
+        region_weight = min(1.0, ref_in_region / max(1, int(ref_mask.sum()) * 0.04))
+        # Map the whole drawing into reference space so position/scale on canvas does not dominate.
+        score = density * 2.2 + min(progress, 1.4) * 0.75 + overlap * 0.55 + region_weight * 0.2
+        if is_focused_detail_step(step):
+            score -= 0.12
+        if step_number > 18:
+            score -= min(0.25, (step_number - 18) * 0.008)
+        region_area_ratio = (w * h) / max(1, reference.width * reference.height)
+        title = str(step.get("title", "")).lower()
+        if mapped_area_ratio > 0.35 and region_area_ratio < 0.08:
+            score -= 0.8
+        if mapped_area_ratio > 0.35 and is_focused_detail_step(step):
+            score -= 0.35
+        if mapped_area_ratio > 0.35 and ("clean outer line" in title or "big silhouette" in title):
+            score += 0.38
+        if focus_step == step_number:
+            score += 0.65
         scored.append((score, progress, density, overlap, step, region, drawn_in_region, ref_in_region))
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    best = scored[0]
+    if not scored:
+        step = first_drawing_step(guide)
+        return build_live_response(project, guide, step, 0.0, active_bbox, "Start drawing on a paint layer. The coach will map your marks to the reference.", [], segments=[])
+
+    segments = build_live_segments(project, guide, scored, focus_step, mapped_active_bbox, active_bbox, ref_bbox, reference.size, live_overlay_dir)
+
+    best = None
+    if focus_step is not None:
+        best = next((item for item in scored if int(item[4].get("step", 1)) == focus_step), None)
+    if best is None:
+        best = scored[0]
     score, progress, density, overlap, step, region, drawn, ref_count = best
-    comments = make_live_comments(step, region, active_bbox, progress, density, overlap, drawn, ref_count)
+    comments = make_live_comments(step, region, mapped_active_bbox, progress, density, overlap, drawn, ref_count)
     next_step = suggest_next_step(guide, int(step.get("step", 1)), progress)
-    return build_live_response(project, guide, step, progress, active_bbox, comments[0], comments, next_step=next_step, score=score)
+    live_overlay = render_transformed_live_overlay(project, live_overlay_dir, int(step.get("step", 1)), ref_bbox, active_bbox, reference.size)
+    return build_live_response(
+        project,
+        guide,
+        step,
+        progress,
+        active_bbox,
+        comments[0],
+        comments,
+        next_step=next_step,
+        score=score,
+        live_overlay_path=live_overlay,
+        segments=segments,
+        alignment={"referenceBbox": ref_bbox, "drawingBbox": active_bbox, "mappedDrawingBbox": mapped_active_bbox},
+    )
+
+
+def build_live_segments(project, guide, scored, focus_step, mapped_active_bbox, active_bbox, ref_bbox, reference_size, live_overlay_dir):
+    segments = []
+    seen_detail_regions = set()
+    broad_count = 0
+    max_segments = 18
+
+    def add_item(item, force=False):
+        nonlocal broad_count
+        if len(segments) >= max_segments and not force:
+            return False
+        score, progress, density, overlap, step, region, drawn, ref_count = item
+        step_number = int(step.get("step", 1))
+        if drawn < 25 and ref_count < 80 and len(segments) >= 6 and not force:
+            return False
+        area_ratio = (region["w"] * region["h"]) / max(1, reference_size[0] * reference_size[1])
+        if area_ratio > 0.35 and broad_count >= 4 and not force:
+            return False
+        if is_focused_detail_step(step):
+            key = region_signature(region)
+            if key in seen_detail_regions and not force:
+                return False
+            seen_detail_regions.add(key)
+        if area_ratio > 0.35:
+            broad_count += 1
+        comments = make_live_comments(step, region, mapped_active_bbox, progress, density, overlap, drawn, ref_count)
+        live_overlay = render_transformed_live_overlay(project, live_overlay_dir, step_number, ref_bbox, active_bbox, reference_size)
+        segments.append(segment_response(project, guide, step, progress, active_bbox, comments, score, live_overlay))
+        return True
+
+    if focus_step is not None:
+        focused = next((item for item in scored if int(item[4].get("step", 1)) == focus_step), None)
+        if focused:
+            add_item(focused, force=True)
+
+    for item in scored:
+        if len(segments) >= max_segments:
+            break
+        if focus_step is not None and int(item[4].get("step", 1)) == focus_step:
+            continue
+        add_item(item)
+    return segments
+
+
+def first_drawing_step(guide):
+    for step in guide.get("steps", []):
+        if not is_live_prep_step(step):
+            return step
+    return guide.get("steps", [{}])[0]
+
+
+def is_live_prep_step(step):
+    title = str(step.get("title", "")).lower()
+    return int(step.get("step", 1)) <= 2 or "canvas setup" in title or "place the reference" in title
+
+
+def is_focused_detail_step(step):
+    return str(step.get("title", "")).lower().startswith("focused detail pass")
+
+
+def region_signature(region):
+    return (
+        round(region.get("x", 0) / 18),
+        round(region.get("y", 0) / 18),
+        round(region.get("w", 0) / 18),
+        round(region.get("h", 0) / 18),
+    )
+
+
+def flatten_for_live(image):
+    image = ImageOps_exif_transpose(image)
+    if image.mode == "RGBA":
+        # Krita exports transparent canvas pixels with alpha 0. Composite over white
+        # so black drawing strokes do not disappear into a black transparent RGB value.
+        bg = Image.new("RGBA", image.size, (255, 255, 255, 255))
+        bg.alpha_composite(image)
+        return bg.convert("RGB")
+    if image.mode != "RGB":
+        return image.convert("RGB")
+    return image
+
+
+def map_mask_to_reference(mask, active_bbox, ref_bbox, width, height):
+    mapped = np.zeros((height, width), dtype=bool)
+    if int(mask.sum()) <= 0:
+        return mapped
+    ax, ay, aw, ah = active_bbox["x"], active_bbox["y"], active_bbox["w"], active_bbox["h"]
+    rx, ry, rw, rh = ref_bbox["x"], ref_bbox["y"], ref_bbox["w"], ref_bbox["h"]
+    crop = mask[ay:ay + ah, ax:ax + aw]
+    if crop.size == 0:
+        return mapped
+    crop_img = Image.fromarray((crop.astype(np.uint8) * 255), mode="L").resize((rw, rh), Image.NEAREST)
+    crop_arr = np.array(crop_img) > 0
+    mapped[ry:ry + rh, rx:rx + rw] = crop_arr[: max(0, min(rh, height - ry)), : max(0, min(rw, width - rx))]
+    return mapped
+
+
+def render_transformed_live_overlay(project, live_overlay_dir, step_number, ref_bbox, active_bbox, size):
+    source = project / "overlays" / f"step_{step_number:03d}.png"
+    if not source.exists():
+        return ""
+    output = live_overlay_dir / f"live_step_{step_number:03d}.png"
+    try:
+        overlay = Image.open(source).convert("RGBA")
+        rx, ry, rw, rh = ref_bbox["x"], ref_bbox["y"], ref_bbox["w"], ref_bbox["h"]
+        ax, ay, aw, ah = active_bbox["x"], active_bbox["y"], active_bbox["w"], active_bbox["h"]
+        crop = overlay.crop((rx, ry, rx + rw, ry + rh)).resize((max(1, aw), max(1, ah)), Image.LANCZOS)
+        canvas = Image.new("RGBA", size, (255, 255, 255, 0))
+        canvas.alpha_composite(crop, (ax, ay))
+        canvas.save(output)
+        return str(output)
+    except Exception:
+        return str(source)
 
 
 def find_live_project(artworks_root, project_id):
@@ -772,10 +935,13 @@ def make_live_comments(step, region, active_bbox, progress, density, overlap, dr
     rx, ry = region["x"] + region["w"] / 2, region["y"] + region["h"] / 2
     ax, ay = active_bbox["x"] + active_bbox["w"] / 2, active_bbox["y"] + active_bbox["h"] / 2
     dx, dy = ax - rx, ay - ry
-    if abs(dx) > region["w"] * 0.35:
-        comments.append("Your active marks are drifting horizontally from this step area; check placement against the overlay.")
-    if abs(dy) > region["h"] * 0.35:
-        comments.append("Your active marks are drifting vertically from this step area; zoom out and compare height.")
+    active_area = active_bbox["w"] * active_bbox["h"]
+    region_area = region["w"] * region["h"]
+    if active_area <= region_area * 1.6:
+        if abs(dx) > region["w"] * 0.35:
+            comments.append("Your active marks are drifting horizontally from this step area; check placement against the overlay.")
+        if abs(dy) > region["h"] * 0.35:
+            comments.append("Your active marks are drifting vertically from this step area; zoom out and compare height.")
     if overlap < 0.18 and drawn > 250:
         comments.append("The marks do not overlap much with the reference structure yet; use the overlay to re-anchor the main contour.")
     if density > 0.23 and progress < 0.4:
@@ -790,16 +956,12 @@ def suggest_next_step(guide, step_number, progress):
     return min(len(steps), step_number + 1)
 
 
-def build_live_response(project, guide, step, progress, active_bbox, message, comments, next_step=None, score=0.0):
+def segment_response(project, guide, step, progress, active_bbox, comments, score, live_overlay_path):
     step_number = int(step.get("step", 1))
     overlay = project / "overlays" / f"step_{step_number:03d}.png"
     card = project / "steps" / f"step_{step_number:03d}_card.png"
     return {
-        "status": "ok",
-        "projectId": project.name,
-        "title": guide.get("title", "Krita Guide"),
         "step": step_number,
-        "recommendedStep": next_step or step_number,
         "stepTitle": step.get("title", f"Step {step_number}"),
         "layer": step.get("layer", ""),
         "brush": step.get("brush", ""),
@@ -810,14 +972,29 @@ def build_live_response(project, guide, step, progress, active_bbox, message, co
         "activeBbox": active_bbox,
         "progressPercent": round(max(0.0, min(progress * 100.0, 160.0)), 1),
         "score": round(float(score), 5),
-        "message": message,
+        "message": comments[0] if comments else "",
         "comments": comments,
         "overlayPath": str(overlay) if overlay.exists() else "",
+        "liveOverlayPath": live_overlay_path,
         "cardPath": str(card) if card.exists() else "",
         "instruction": step.get("instruction", ""),
         "checkpoint": step.get("checkpoint", ""),
         "commonMistake": step.get("commonMistake", ""),
     }
+
+
+def build_live_response(project, guide, step, progress, active_bbox, message, comments, next_step=None, score=0.0, live_overlay_path="", segments=None, alignment=None):
+    segment = segment_response(project, guide, step, progress, active_bbox, comments, score, live_overlay_path)
+    segment.update({
+        "status": "ok",
+        "projectId": project.name,
+        "title": guide.get("title", "Krita Guide"),
+        "recommendedStep": next_step or segment["step"],
+        "alignment": alignment or {},
+        "segments": segments or [],
+    })
+    segment["message"] = message
+    return segment
 
 
 def rgb_to_hex(rgb):

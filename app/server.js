@@ -193,13 +193,16 @@ async function liveFeedback(res, body) {
 
   const projectId = body.projectId ? String(body.projectId) : "";
   if (projectId) assertArtworkId(projectId);
+  const focusStep = Number.isFinite(Number(body.focusStep)) ? String(Math.max(1, Math.floor(Number(body.focusStep)))) : "";
   const sessionId = String(body.sessionId || "krita-live").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
   await fsp.mkdir(TMP_ROOT, { recursive: true });
   const snapshotPath = path.join(TMP_ROOT, `${sessionId}-${Date.now()}.png`);
   await fsp.writeFile(snapshotPath, Buffer.from(match[1], "base64"));
 
   try {
-    const result = await runWorker(["live-feedback", ARTWORKS_ROOT, snapshotPath, projectId], { timeoutMs: 120000 });
+    const args = ["live-feedback", ARTWORKS_ROOT, snapshotPath, projectId];
+    if (focusStep) args.push(focusStep);
+    const result = await runWorker(args, { timeoutMs: 120000 });
     const feedback = parseJsonMaybe(result.stdout);
     return sendJson(res, 200, { ok: true, feedback });
   } finally {

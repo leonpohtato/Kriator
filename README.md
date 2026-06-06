@@ -64,4 +64,6 @@ D:\data\krita-guide-agent\INSTALL_KRITA_LIVE_PLUGIN.cmd
 
 Restart Krita, enable `Krita Guide Live Coach` in `Settings > Configure Krita > Python Plugin Manager`, restart Krita again, then open `Settings > Dockers > Krita Guide Live Coach`.
 
-The docker captures the active document every few seconds, hides its own overlay before capture, asks the local app which guide step matches the current drawing area, and replaces the live overlay layer automatically.
+The docker captures the active document every few seconds, hides its own overlay before capture, and analyzes your whole drawing against the reference. It maps your marks to the reference even if your sketch is shifted or scaled on the canvas.
+
+The segment list shows clickable comments for likely matching sections. Click a segment to lock focus there while you keep tweaking it; the comments and overlay keep updating for that same section. Press `Follow detected` to return to automatic section following.

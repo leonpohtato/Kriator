@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QTextEdit,
     QMessageBox,
+    QScrollArea,
 )
 
 
@@ -33,6 +34,8 @@ class KritaGuideLiveDocker(DockWidget):
         self.project_id = ""
         self.last_step = None
         self.last_overlay_path = ""
+        self.focus_step = None
+        self.segment_results = []
         self.busy = False
 
         root = QWidget()
@@ -51,9 +54,11 @@ class KritaGuideLiveDocker(DockWidget):
         self.start_btn = QPushButton("Start live")
         self.stop_btn = QPushButton("Stop")
         self.once_btn = QPushButton("Analyze now")
+        self.follow_btn = QPushButton("Follow detected")
         row.addWidget(self.start_btn)
         row.addWidget(self.stop_btn)
         row.addWidget(self.once_btn)
+        row.addWidget(self.follow_btn)
         layout.addLayout(row)
 
         row2 = QHBoxLayout()
@@ -79,6 +84,18 @@ class KritaGuideLiveDocker(DockWidget):
         self.step_label.setWordWrap(True)
         layout.addWidget(self.step_label)
 
+        self.segment_label = QLabel("Segments: analyze the canvas to populate clickable comments.")
+        self.segment_label.setWordWrap(True)
+        layout.addWidget(self.segment_label)
+
+        self.segment_scroll = QScrollArea()
+        self.segment_scroll.setWidgetResizable(True)
+        self.segment_scroll.setMinimumHeight(160)
+        self.segment_container = QWidget()
+        self.segment_layout = QVBoxLayout(self.segment_container)
+        self.segment_scroll.setWidget(self.segment_container)
+        layout.addWidget(self.segment_scroll)
+
         self.feedback = QTextEdit()
         self.feedback.setReadOnly(True)
         self.feedback.setMinimumHeight(210)
@@ -89,6 +106,7 @@ class KritaGuideLiveDocker(DockWidget):
         self.start_btn.clicked.connect(self.start_live)
         self.stop_btn.clicked.connect(self.stop_live)
         self.once_btn.clicked.connect(self.analyze_now)
+        self.follow_btn.clicked.connect(self.follow_detected)
         self.make_layers_btn.clicked.connect(self.make_work_layers)
 
     def canvasChanged(self, canvas):
@@ -102,6 +120,11 @@ class KritaGuideLiveDocker(DockWidget):
     def stop_live(self):
         self.timer.stop()
         self.status.setText("Live monitoring stopped.")
+
+    def follow_detected(self):
+        self.focus_step = None
+        self.status.setText("Following the strongest detected segment again.")
+        self.analyze_now()
 
     def analyze_now(self):
         if self.busy:
@@ -142,6 +165,7 @@ class KritaGuideLiveDocker(DockWidget):
         payload = {
             "sessionId": SESSION_ID,
             "projectId": self.project_input.text().strip(),
+            "focusStep": self.focus_step,
             "snapshotDataUrl": "data:image/png;base64," + encoded,
             "timestamp": time.time(),
         }
@@ -164,10 +188,31 @@ class KritaGuideLiveDocker(DockWidget):
             return
         self.project_id = result.get("projectId", self.project_id)
         self.project_input.setText(self.project_id)
-        step = result.get("recommendedStep") if self.auto_advance.isChecked() else result.get("step")
+        self.segment_results = result.get("segments") or [result]
+        self.render_segment_buttons()
+        segment = self.choose_segment(result)
+        self.display_segment(doc, segment, locked=self.focus_step is not None)
+        self.status.setText(
+            "Reading whole drawing. {0} segment comments updated.".format(len(self.segment_results))
+        )
+
+    def choose_segment(self, result):
+        if self.focus_step is not None:
+            found = self.find_segment_result(self.focus_step)
+            if found:
+                return found
+        if not self.auto_advance.isChecked() and self.last_step is not None:
+            found = self.find_segment_result(self.last_step)
+            if found:
+                return found
+        return result
+
+    def display_segment(self, doc, result, locked=False):
+        step = result.get("step")
         self.last_step = step
         self.step_label.setText(
-            "Step {0}: {1}\nLayer: {2} | Brush: {3} {4}px | {5}".format(
+            "{0}Step {1}: {2}\nLayer: {3} | Brush: {4} {5}px | {6}".format(
+                "Locked focus: " if locked else "",
                 result.get("step"),
                 result.get("stepTitle"),
                 result.get("layer"),
@@ -189,9 +234,45 @@ class KritaGuideLiveDocker(DockWidget):
             "Common mistake: " + str(result.get("commonMistake", "")),
         ]
         self.feedback.setPlainText("\n".join(details))
-        self.status.setText("Reading Krita live. Focus: step {0}.".format(result.get("step")))
-        if self.auto_overlay.isChecked() and result.get("overlayPath"):
-            self.ensure_overlay_layer(doc, result.get("overlayPath"))
+        if self.auto_overlay.isChecked():
+            overlay = result.get("liveOverlayPath") or result.get("overlayPath")
+            if overlay:
+                self.ensure_overlay_layer(doc, overlay)
+
+    def render_segment_buttons(self):
+        while self.segment_layout.count():
+            item = self.segment_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        if self.focus_step is None:
+            self.segment_label.setText("Segments found: {0}. Click one to lock focus and update its overlay.".format(len(self.segment_results)))
+        else:
+            self.segment_label.setText("Segments found: {0}. Locked to step {1}; Follow detected unlocks.".format(len(self.segment_results), self.focus_step))
+        for segment in self.segment_results:
+            step = segment.get("step")
+            title = segment.get("stepTitle", "Untitled")
+            progress = segment.get("progressPercent", 0)
+            prefix = "* " if self.focus_step == step else ""
+            button = QPushButton("{0}Step {1}: {2} ({3}%)".format(prefix, step, title, progress))
+            button.setToolTip("\n".join(segment.get("comments") or []))
+            button.clicked.connect(lambda checked=False, s=segment: self.focus_segment(s))
+            self.segment_layout.addWidget(button)
+        self.segment_layout.addStretch(1)
+
+    def focus_segment(self, segment):
+        self.focus_step = segment.get("step")
+        doc = Krita.instance().activeDocument()
+        if doc is not None:
+            self.display_segment(doc, segment, locked=True)
+        self.render_segment_buttons()
+        self.status.setText("Locked focus to step {0}. Live updates will keep that section selected.".format(self.focus_step))
+
+    def find_segment_result(self, step):
+        for segment in self.segment_results:
+            if segment.get("step") == step:
+                return segment
+        return None
 
     def ensure_overlay_layer(self, doc, overlay_path):
         if overlay_path == self.last_overlay_path and self.find_node(doc, OVERLAY_NAME):
