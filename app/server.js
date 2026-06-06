@@ -13,6 +13,12 @@ const PORT = Number(process.env.PORT || 8788);
 const PYTHON = process.env.PYTHON || "python";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.4-mini";
 const KRITA_PATH = process.env.KRITA_PATH || "C:\\Program Files\\Krita (x64)\\bin\\krita.exe";
+const KRITA_CANDIDATES = [
+  process.env.KRITA_PATH,
+  "C:\\Program Files\\Krita (x64)\\bin\\krita.exe",
+  "C:\\Program Files\\Krita\\bin\\krita.exe",
+  "C:\\Program Files (x86)\\Krita (x64)\\bin\\krita.exe"
+].filter(Boolean);
 const KEEP_LATEST = Number(process.env.GUIDE_AGENT_KEEP_LATEST || 20);
 const STORAGE_ROOT = path.join(ROOT, "storage");
 const ARTWORKS_ROOT = path.join(STORAGE_ROOT, "artworks");
@@ -73,6 +79,7 @@ async function handle(req, res) {
   }
 
   if (method === "GET" && url.pathname === "/api/health") {
+    const krita = findKritaPath();
     return sendJson(res, 200, {
       ok: true,
       port: PORT,
@@ -81,7 +88,9 @@ async function handle(req, res) {
       artworksRoot: ARTWORKS_ROOT,
       openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
       model: OPENAI_MODEL,
-      kritaPath: KRITA_PATH,
+      kritaPath: krita.path || KRITA_PATH,
+      kritaExists: Boolean(krita.path),
+      kritaTried: krita.tried,
       keepLatest: KEEP_LATEST
     });
   }
@@ -848,20 +857,96 @@ async function downloadArtwork(res, id) {
   fs.createReadStream(zipPath).pipe(res);
 }
 
+function findKritaPath() {
+  const tried = [];
+  for (const candidate of KRITA_CANDIDATES) {
+    if (!candidate) continue;
+    tried.push(candidate);
+    if (fs.existsSync(candidate)) return { path: candidate, tried };
+  }
+  return { path: "", tried };
+}
+
+function launchKrita(kritaPath, reference) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const child = spawn(kritaPath, [reference], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false
+    });
+
+    const finish = (ok, payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (ok) {
+        child.unref();
+        resolve(payload);
+      } else {
+        reject(payload);
+      }
+    };
+
+    const timer = setTimeout(() => {
+      finish(true, {
+        pid: child.pid,
+        exitedQuickly: false
+      });
+    }, 1800);
+
+    child.once("error", (error) => {
+      finish(false, new Error(`Failed to start Krita at ${kritaPath}: ${error.message}`));
+    });
+
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        finish(true, {
+          pid: child.pid,
+          exitedQuickly: true
+        });
+        return;
+      }
+      finish(false, new Error(`Krita exited immediately after launch (code ${code ?? "none"}, signal ${signal ?? "none"}).`));
+    });
+  });
+}
+
 async function openKrita(res, id) {
   assertArtworkId(id);
   const dir = artworkDir(id);
   const reference = path.join(dir, "reference.png");
   if (!fs.existsSync(reference)) return sendJson(res, 404, { ok: false, error: "reference.png not found." });
-  if (!fs.existsSync(KRITA_PATH)) {
-    return sendJson(res, 400, { ok: false, error: `Krita not found at ${KRITA_PATH}. Set KRITA_PATH in .env.` });
+  const krita = findKritaPath();
+  if (!krita.path) {
+    return sendJson(res, 400, {
+      ok: false,
+      error: `Krita was not found. Set KRITA_PATH in .env to your krita.exe path.`,
+      tried: krita.tried
+    });
   }
-  const child = spawn(KRITA_PATH, [reference], { detached: true, stdio: "ignore" });
-  child.unref();
+
+  let launch;
+  try {
+    launch = await launchKrita(krita.path, reference);
+  } catch (error) {
+    return sendJson(res, 500, {
+      ok: false,
+      error: error.message || String(error),
+      kritaPath: krita.path,
+      referencePath: reference
+    });
+  }
+
   sendJson(res, 200, {
     ok: true,
-    message: "Krita launched with the reference image. Use the generated krita/guide_loader.py script in Scripter to load overlays.",
-    kritaPath: KRITA_PATH
+    message: launch.exitedQuickly
+      ? "Krita accepted the launch command. If Krita was already open, check that window for the reference image."
+      : "Krita is running with the reference image. Use the Krita Guide Live Coach docker, or run krita/guide_loader.py in Scripter for guide layers.",
+    kritaPath: krita.path,
+    referencePath: reference,
+    pid: launch.pid,
+    exitedQuickly: launch.exitedQuickly
   });
 }
 

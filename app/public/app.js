@@ -177,7 +177,13 @@ async function openKrita() {
   setBusy(true, "Opening Krita...");
   try {
     const data = await api(`/api/artworks/${state.artwork.id}/open-krita`, { method: "POST" });
-    setStatus(data.message || "Krita launch requested.");
+    const details = [
+      data.message || "Krita launch requested.",
+      data.referencePath ? `Reference: ${data.referencePath}` : "",
+      data.kritaPath ? `Krita: ${data.kritaPath}` : "",
+      data.exitedQuickly ? "Krita may have handed the file to an already-open window. Alt+Tab to Krita if it is not in front." : ""
+    ].filter(Boolean);
+    setStatus(details.join("\n"));
   } catch (error) {
     setStatus(`Open Krita failed:\n${error.message}`);
   } finally {
