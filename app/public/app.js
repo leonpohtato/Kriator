@@ -2,6 +2,7 @@ const state = {
   health: null,
   file: null,
   artwork: null,
+  liveSessions: [],
   activeTab: "steps",
   busy: false
 };
@@ -26,6 +27,7 @@ const els = {
   stepsOutput: document.querySelector("#stepsOutput"),
   overlaysOutput: document.querySelector("#overlaysOutput"),
   kritaOutput: document.querySelector("#kritaOutput"),
+  liveOutput: document.querySelector("#liveOutput"),
   storageOutput: document.querySelector("#storageOutput"),
   downloadOutput: document.querySelector("#downloadOutput")
 };
@@ -115,6 +117,7 @@ async function uploadSelectedFile() {
       body: JSON.stringify({ fileName: state.file.name, dataUrl })
     });
     state.artwork = data.artwork;
+    state.liveSessions = [];
     setStatus(`Uploaded: ${state.artwork.fileName}\nStatus: ${state.artwork.status}`);
     renderArtwork();
     await refreshHistory();
@@ -159,6 +162,7 @@ async function loadArtwork(id) {
   try {
     const data = await api(`/api/artworks/${id}`);
     state.artwork = data.artwork;
+    state.liveSessions = [];
     setStatus(`Loaded: ${state.artwork.fileName}\nStatus: ${state.artwork.status}`);
     renderArtwork();
   } catch (error) {
@@ -195,6 +199,7 @@ function renderArtwork() {
   renderSteps();
   renderOverlays();
   renderKrita();
+  renderLiveSessions();
   renderStorage();
   renderDownload();
 }
@@ -275,6 +280,187 @@ function renderKrita() {
   document.querySelector("#kritaTabOpenBtn")?.addEventListener("click", openKrita);
 }
 
+async function renderLiveSessions() {
+  const artwork = state.artwork;
+  if (!artwork?.id) {
+    els.liveOutput.className = "empty-output";
+    els.liveOutput.textContent = "Load an artwork to view live telemetry sessions.";
+    return;
+  }
+  els.liveOutput.className = "info-panel";
+  els.liveOutput.innerHTML = `
+    <div class="button-row">
+      <button id="refreshLiveBtn">Refresh live sessions</button>
+      <a class="link-button" href="/api/artworks/${artwork.id}/live-sessions" target="_blank" rel="noreferrer">Open API list</a>
+    </div>
+    <div class="empty-output">Loading live telemetry sessions...</div>
+  `;
+  document.querySelector("#refreshLiveBtn")?.addEventListener("click", () => loadLiveSessions(true));
+  await loadLiveSessions(false);
+}
+
+async function loadLiveSessions(forceStatus) {
+  const artwork = state.artwork;
+  if (!artwork?.id) return;
+  if (forceStatus) setStatus("Refreshing live telemetry sessions...");
+  try {
+    const data = await api(`/api/artworks/${artwork.id}/live-sessions`);
+    state.liveSessions = data.sessions || [];
+    renderLiveSessionList();
+  } catch (error) {
+    els.liveOutput.className = "empty-output";
+    els.liveOutput.textContent = `Live telemetry failed: ${error.message}`;
+  }
+}
+
+function renderLiveSessionList() {
+  const artwork = state.artwork;
+  const sessions = state.liveSessions || [];
+  els.liveOutput.className = "info-panel";
+  if (!sessions.length) {
+    els.liveOutput.innerHTML = `
+      <div class="button-row">
+        <button id="refreshLiveBtn">Refresh live sessions</button>
+      </div>
+      <div class="empty-output">No live sessions recorded yet. In Krita, start the Live Coach with Record input metrics checked, then draw.</div>
+    `;
+    document.querySelector("#refreshLiveBtn")?.addEventListener("click", () => loadLiveSessions(true));
+    return;
+  }
+  els.liveOutput.innerHTML = `
+    <div class="button-row">
+      <button id="refreshLiveBtn">Refresh live sessions</button>
+      <a class="link-button" href="/api/artworks/${artwork.id}/live-sessions" target="_blank" rel="noreferrer">Open API list</a>
+    </div>
+    <div class="telemetry-grid">
+      ${sessions.map((session, index) => `
+        <button class="telemetry-session ${index === 0 ? "active" : ""}" data-session="${escapeHtml(session.sessionId)}">
+          <strong>${escapeHtml(session.sessionId)}</strong>
+          <span>${escapeHtml(session.updatedAt)} | ${formatBytes(session.bytes)}</span>
+        </button>
+      `).join("")}
+    </div>
+    <div id="liveSessionDetail" class="telemetry-detail">Select a session to view recorded input metrics.</div>
+  `;
+  document.querySelector("#refreshLiveBtn")?.addEventListener("click", () => loadLiveSessions(true));
+  for (const button of document.querySelectorAll(".telemetry-session")) {
+    button.addEventListener("click", () => loadLiveSessionDetail(button.dataset.session));
+  }
+  loadLiveSessionDetail(sessions[0].sessionId);
+}
+
+async function loadLiveSessionDetail(sessionId) {
+  const artwork = state.artwork;
+  if (!artwork?.id || !sessionId) return;
+  const detail = document.querySelector("#liveSessionDetail");
+  if (detail) detail.textContent = "Loading session...";
+  try {
+    const data = await api(`/api/artworks/${artwork.id}/live-sessions/${encodeURIComponent(sessionId)}`);
+    renderLiveSessionDetail(data.sessionId, data.records || []);
+  } catch (error) {
+    if (detail) detail.textContent = `Session failed: ${error.message}`;
+  }
+}
+
+function renderLiveSessionDetail(sessionId, records) {
+  const detail = document.querySelector("#liveSessionDetail");
+  if (!detail) return;
+  if (!records.length) {
+    detail.innerHTML = `<div class="empty-output">Session ${escapeHtml(sessionId)} has no records.</div>`;
+    return;
+  }
+  const latest = records[records.length - 1];
+  const summary = latest.telemetry?.summary || {};
+  const context = latest.telemetry?.context || {};
+  const matrix = latest.telemetry?.capabilityMatrix || {};
+  const feedback = latest.feedback || {};
+  const strokes = latest.telemetry?.strokes || [];
+  detail.innerHTML = `
+    <div class="telemetry-summary">
+      ${metricCard("Records", records.length)}
+      ${metricCard("Events", summary.eventCount || 0)}
+      ${metricCard("Strokes", summary.strokeCount || strokes.length || 0)}
+      ${metricCard("Pressure", matrix.pressure ? "Yes" : "No")}
+      ${metricCard("Active layer", context.activeLayer?.name || "-")}
+      ${metricCard("Category", context.activeCategory || "-")}
+    </div>
+    <div class="telemetry-columns">
+      <section>
+        <h3>Latest Coach State</h3>
+        <dl>
+          ${defRow("Step", `${feedback.step || "-"} ${feedback.stepTitle || ""}`)}
+          ${defRow("Progress", `${feedback.progressPercent ?? "-"}%`)}
+          ${defRow("Stage", feedback.stageInfo?.stage || "-")}
+          ${defRow("Assessment", context.assessmentMode || "-")}
+        </dl>
+      </section>
+      <section>
+        <h3>Stroke Metrics</h3>
+        <dl>
+          ${defRow("Distance", `${round(summary.distancePx)} px`)}
+          ${defRow("Avg stroke distance", `${round(summary.avgStrokeDistancePx)} px`)}
+          ${defRow("Max speed", `${round(summary.maxStrokeSpeedPxPerSec)} px/s`)}
+          ${defRow("Pressure avg/max", `${round(summary.avgPressure)} / ${round(summary.maxPressure)}`)}
+        </dl>
+      </section>
+      <section>
+        <h3>Brush / Tool</h3>
+        <dl>
+          ${defRow("Brush", context.tool?.brushPreset || "-")}
+          ${defRow("Brush size", context.tool?.brushSize ?? "-")}
+          ${defRow("Opacity / Flow", `${context.tool?.paintingOpacity ?? "-"} / ${context.tool?.paintingFlow ?? "-"}`)}
+          ${defRow("Foreground", context.tool?.foregroundColor || "-")}
+        </dl>
+      </section>
+    </div>
+    <section>
+      <h3>Capability Matrix</h3>
+      <div class="capability-grid">
+        ${renderCapability("Visual snapshot", matrix.visualSnapshot)}
+        ${renderCapability("Raw input events", matrix.rawInputEvents)}
+        ${renderCapability("Stroke summaries", matrix.strokeSummaries)}
+        ${renderCapability("Pressure", matrix.pressure)}
+        ${renderCapability("Tilt", matrix.tilt)}
+        ${renderCapability("Rotation", matrix.rotation)}
+        ${renderCapability("Tangential pressure", matrix.tangentialPressure)}
+        ${renderCapability("Buttons", matrix.buttons)}
+        ${renderCapability("Active layer", matrix.activeLayer)}
+        ${renderCapability("Layer categories", matrix.visibleLayerCategories)}
+        ${renderCapability("Brush preset", matrix.brushPreset)}
+        ${renderCapability("Brush size", matrix.brushSize)}
+      </div>
+    </section>
+    <section>
+      <h3>Visible Categories</h3>
+      <pre>${escapeHtml(JSON.stringify(context.visibleCategoryCounts || {}, null, 2))}</pre>
+    </section>
+    <section>
+      <h3>Unsupported / Not Guessed</h3>
+      <ul>${(matrix.unsupported || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("") || "<li>None reported.</li>"}</ul>
+    </section>
+    <div class="button-row">
+      <a class="link-button" href="/api/artworks/${state.artwork.id}/live-sessions/${encodeURIComponent(sessionId)}" target="_blank" rel="noreferrer">Open full JSON</a>
+    </div>
+  `;
+}
+
+function metricCard(label, value) {
+  return `<div><strong>${escapeHtml(label)}</strong><span>${escapeHtml(value)}</span></div>`;
+}
+
+function defRow(label, value) {
+  return `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`;
+}
+
+function renderCapability(label, value) {
+  return `<div class="${value ? "yes" : "no"}"><strong>${escapeHtml(label)}</strong><span>${value ? "Captured" : "Unavailable"}</span></div>`;
+}
+
+function round(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.round(number * 100) / 100 : 0;
+}
+
 function renderStorage() {
   const artwork = state.artwork;
   els.storageOutput.className = "info-panel";
@@ -350,6 +536,7 @@ function setTab(name) {
   state.activeTab = name;
   for (const tab of els.tabs) tab.classList.toggle("active", tab.dataset.tab === name);
   for (const panel of els.panels) panel.classList.toggle("active", panel.id === `tab-${name}`);
+  if (name === "live" && state.artwork?.id) loadLiveSessions(false);
 }
 
 function setBusy(value, message) {

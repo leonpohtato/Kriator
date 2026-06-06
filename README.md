@@ -105,3 +105,5 @@ Useful endpoints:
 
 - `GET /api/artworks/<artwork-id>/live-sessions`
 - `GET /api/artworks/<artwork-id>/live-sessions/<session-id>`
+
+The web app also has a `Live` tab that displays recorded sessions, latest stroke metrics, active layer/category, brush/tool context, and the captured/unavailable capability matrix.
