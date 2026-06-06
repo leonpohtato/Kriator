@@ -262,12 +262,16 @@ function normalizeTelemetry(input) {
       device: finiteNumber(event.device)
     };
   });
+  const strokes = normalizeStrokes(source.strokes, events);
+  const summary = summarizeTelemetry(events, source.summary);
+  const context = normalizeTelemetryContext(source.context);
   return {
     schema: safeSmallString(source.schema, 80) || "kriator-live-input-v1",
-    summary: summarizeTelemetry(events, source.summary),
+    summary,
     events,
-    strokes: normalizeStrokes(source.strokes, events),
-    context: normalizeTelemetryContext(source.context)
+    strokes,
+    context,
+    capabilityMatrix: normalizeCapabilityMatrix(source.capabilityMatrix, events, strokes, context, summary)
   };
 }
 
@@ -401,6 +405,7 @@ function normalizeTelemetryContext(input) {
   const source = input && typeof input === "object" ? input : {};
   const canvas = source.canvas && typeof source.canvas === "object" ? source.canvas : {};
   const activeLayer = source.activeLayer && typeof source.activeLayer === "object" ? source.activeLayer : {};
+  const tool = source.tool && typeof source.tool === "object" ? source.tool : {};
   return {
     documentName: safeSmallString(source.documentName, 120),
     documentFileName: String(source.documentFileName || "").slice(0, 260),
@@ -417,10 +422,60 @@ function normalizeTelemetryContext(input) {
       opacity: finiteNumber(activeLayer.opacity)
     },
     activeCategory: safeSmallString(source.activeCategory, 80),
+    tool: {
+      windowAvailable: Boolean(tool.windowAvailable),
+      viewAvailable: Boolean(tool.viewAvailable),
+      brushPreset: String(tool.brushPreset || "").slice(0, 160),
+      brushSize: finiteNumber(tool.brushSize),
+      paintingOpacity: finiteNumber(tool.paintingOpacity),
+      paintingFlow: finiteNumber(tool.paintingFlow),
+      blendingMode: String(tool.blendingMode || "").slice(0, 120),
+      foregroundColor: String(tool.foregroundColor || "").slice(0, 160),
+      backgroundColor: String(tool.backgroundColor || "").slice(0, 160),
+      note: String(tool.note || "").slice(0, 220)
+    },
     visibleCategoryCounts: normalizeCategoryCounts(source.visibleCategoryCounts),
     visibleLayerCount: finiteNumber(source.visibleLayerCount) || 0,
     assessmentMode: safeSmallString(source.assessmentMode, 80),
     categoryAssessment: String(source.categoryAssessment || "").slice(0, 220)
+  };
+}
+
+function normalizeCapabilityMatrix(input, events, strokes, context, summary) {
+  const source = input && typeof input === "object" ? input : {};
+  const tool = context.tool || {};
+  const activeLayer = context.activeLayer || {};
+  const computed = {
+    schema: "kriator-live-capability-matrix-v1",
+    captureMethod: "Krita document snapshot plus Qt app event filter",
+    visualSnapshot: true,
+    rawInputEvents: events.length > 0,
+    strokeSummaries: strokes.length > 0,
+    pressure: (summary.pressureSamples || 0) > 0,
+    tilt: events.some((event) => event.xTilt !== null || event.yTilt !== null),
+    rotation: events.some((event) => event.rotation !== null),
+    tangentialPressure: events.some((event) => event.tangentialPressure !== null),
+    buttons: events.some((event) => event.button !== null || event.buttons !== null),
+    activeLayer: Boolean(activeLayer.name),
+    activeLayerCategory: Boolean(context.activeCategory),
+    visibleLayerCategories: Object.keys(context.visibleCategoryCounts || {}).length > 0,
+    brushPreset: Boolean(tool.brushPreset),
+    brushSize: tool.brushSize !== null,
+    paintingOpacity: tool.paintingOpacity !== null,
+    paintingFlow: tool.paintingFlow !== null,
+    foregroundColor: Boolean(tool.foregroundColor),
+    unsupported: [
+      "Krita brush-engine internal matrices are not exposed by this docker.",
+      "Hidden stabilizer internals and full per-dab brush calculations are not guaranteed."
+    ]
+  };
+  return {
+    ...computed,
+    schema: safeSmallString(source.schema, 100) || computed.schema,
+    captureMethod: String(source.captureMethod || computed.captureMethod).slice(0, 160),
+    unsupported: Array.isArray(source.unsupported)
+      ? source.unsupported.map((item) => String(item).slice(0, 220)).slice(0, 12)
+      : computed.unsupported
   };
 }
 

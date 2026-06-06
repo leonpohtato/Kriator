@@ -99,6 +99,8 @@ Each record stores the current guide step, stage detection, feedback summary, vi
 
 Events are also grouped into stroke summaries with duration, distance, bounding box, speed, and pressure stats. The record includes the active Krita layer name plus a beginner category such as `Rough Sketch`, `Lineart`, `Flat Colors`, `Shadows`, or `Highlights and Texture`. Multiple visible layers in the same category are assessed as one combined visible result, so layers like `My Shadows 1`, `My Shadows 2`, and `Wing Shadows` can all contribute to the same shadow-stage assessment.
 
+Every interval includes a `capabilityMatrix` that states which live signals were actually captured: raw input events, stroke summaries, pressure, tilt, rotation, tangential pressure, active layer/category, visible layer categories, and brush/tool fields when Krita exposes them. Unsupported brush-engine internals are listed explicitly instead of being guessed.
+
 Useful endpoints:
 
 - `GET /api/artworks/<artwork-id>/live-sessions`

@@ -388,6 +388,7 @@ class KritaGuideLiveDocker(DockWidget):
         strokes = self.build_strokes(events)
         context = self.collect_document_context(doc)
         summary = self.summarize_input_events(events, strokes)
+        capability_matrix = self.build_capability_matrix(events, strokes, context, summary)
         self.last_input_summary = summary
         return {
             "schema": "kriator-live-input-v2",
@@ -395,6 +396,7 @@ class KritaGuideLiveDocker(DockWidget):
             "strokes": strokes,
             "summary": summary,
             "context": context,
+            "capabilityMatrix": capability_matrix,
         }
 
     def build_strokes(self, events):
@@ -502,6 +504,7 @@ class KritaGuideLiveDocker(DockWidget):
     def collect_document_context(self, doc):
         active = self.safe_call(doc, "activeNode")
         active_info = self.node_info(active)
+        tool_info = self.collect_tool_context()
         visible = {}
         total_visible = 0
         for node in self.walk_nodes(doc.rootNode()):
@@ -525,10 +528,64 @@ class KritaGuideLiveDocker(DockWidget):
             },
             "activeLayer": active_info,
             "activeCategory": active_info.get("category", "Other"),
+            "tool": tool_info,
             "visibleCategoryCounts": visible,
             "visibleLayerCount": total_visible,
             "assessmentMode": "combined-visible-artwork",
             "categoryAssessment": "Visible layers with matching beginner categories are assessed as one combined result.",
+        }
+
+    def collect_tool_context(self):
+        app = Krita.instance()
+        window = self.safe_call(app, "activeWindow")
+        view = self.safe_call(window, "activeView")
+        brush = self.first_value(view, ["currentBrushPreset", "currentBrush", "brushPreset"])
+        foreground = self.first_value(view, ["foregroundColor", "currentForegroundColor"])
+        background = self.first_value(view, ["backgroundColor", "currentBackgroundColor"])
+        return {
+            "windowAvailable": window is not None,
+            "viewAvailable": view is not None,
+            "brushPreset": self.resource_name(brush),
+            "brushSize": self.first_value(view, ["brushSize", "currentBrushSize"]),
+            "paintingOpacity": self.first_value(view, ["paintingOpacity", "opacity"]),
+            "paintingFlow": self.first_value(view, ["paintingFlow", "flow"]),
+            "blendingMode": self.first_value(view, ["currentBlendingMode", "blendingMode"]),
+            "foregroundColor": self.color_value(foreground),
+            "backgroundColor": self.color_value(background),
+            "note": "Brush/tool fields are recorded only when Krita exposes them through the Python view API.",
+        }
+
+    def build_capability_matrix(self, events, strokes, context, summary):
+        has_pressure = summary.get("pressureSamples", 0) > 0
+        has_tilt = any(item.get("xTilt") is not None or item.get("yTilt") is not None for item in events)
+        has_rotation = any(item.get("rotation") is not None for item in events)
+        has_tangential = any(item.get("tangentialPressure") is not None for item in events)
+        has_buttons = any(item.get("button") is not None or item.get("buttons") is not None for item in events)
+        tool = context.get("tool", {})
+        active_layer = context.get("activeLayer", {})
+        return {
+            "schema": "kriator-live-capability-matrix-v1",
+            "captureMethod": "Krita document snapshot plus Qt app event filter",
+            "visualSnapshot": True,
+            "rawInputEvents": len(events) > 0,
+            "strokeSummaries": len(strokes) > 0,
+            "pressure": has_pressure,
+            "tilt": has_tilt,
+            "rotation": has_rotation,
+            "tangentialPressure": has_tangential,
+            "buttons": has_buttons,
+            "activeLayer": bool(active_layer.get("name")),
+            "activeLayerCategory": bool(context.get("activeCategory")),
+            "visibleLayerCategories": bool(context.get("visibleCategoryCounts")),
+            "brushPreset": bool(tool.get("brushPreset")),
+            "brushSize": tool.get("brushSize") is not None,
+            "paintingOpacity": tool.get("paintingOpacity") is not None,
+            "paintingFlow": tool.get("paintingFlow") is not None,
+            "foregroundColor": bool(tool.get("foregroundColor")),
+            "unsupported": [
+                "Krita brush-engine internal matrices are not exposed by this docker.",
+                "Hidden stabilizer internals and full per-dab brush calculations are not guaranteed.",
+            ],
         }
 
     def node_info(self, node):
@@ -570,6 +627,43 @@ class KritaGuideLiveDocker(DockWidget):
             return attr() if callable(attr) else attr
         except Exception:
             return None
+
+    def first_value(self, obj, names):
+        for name in names:
+            value = self.safe_call(obj, name)
+            if value is not None:
+                return value
+        return None
+
+    def resource_name(self, resource):
+        if resource is None:
+            return ""
+        name = self.safe_call(resource, "name")
+        if name:
+            return str(name)
+        try:
+            return str(resource)
+        except Exception:
+            return ""
+
+    def color_value(self, color):
+        if color is None:
+            return ""
+        qcolor = self.safe_call(color, "toQColor")
+        if qcolor is not None:
+            name = self.safe_call(qcolor, "name")
+            if name:
+                return str(name)
+        components = self.safe_call(color, "components")
+        if components is not None:
+            try:
+                return ",".join(str(round(float(v), 4)) for v in components)
+            except Exception:
+                pass
+        try:
+            return str(color)
+        except Exception:
+            return ""
 
     def event_position(self, event):
         for name in ("posF", "pos", "globalPosF", "globalPos"):
