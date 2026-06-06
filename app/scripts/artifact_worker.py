@@ -697,6 +697,7 @@ def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None):
     ref_mask = np.linalg.norm(ref_arr.astype(np.int16) - np.array(ref_bg, dtype=np.int16), axis=2) > 24
     snap_mask = clean_mask(snap_mask)
     ref_mask = clean_mask(ref_mask)
+    stage_info = classify_live_stage(snap_arr, snap_mask, snap_bg)
 
     active_bbox = bbox_from_mask(snap_mask, reference.width, reference.height, pad=8)
     ref_bbox = analysis.get("fullBbox") or bbox_from_mask(ref_mask, reference.width, reference.height, pad=8)
@@ -709,7 +710,9 @@ def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None):
     mapped_active_bbox = bbox_from_mask(mapped_user_mask, reference.width, reference.height, pad=8)
     mapped_area_ratio = (mapped_active_bbox["w"] * mapped_active_bbox["h"]) / max(1, ref_bbox["w"] * ref_bbox["h"])
     live_overlay_dir = project / "live_overlays"
+    live_visual_dir = project / "live_visuals"
     live_overlay_dir.mkdir(exist_ok=True)
+    live_visual_dir.mkdir(exist_ok=True)
     scored = []
     for step in guide.get("steps", []):
         step_number = int(step.get("step", 1))
@@ -722,11 +725,14 @@ def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None):
         drawn_in_region = int(snap_region.sum())
         ref_in_region = int(ref_region.sum())
         density = drawn_in_region / max(1, w * h)
-        progress = drawn_in_region / max(1, ref_in_region)
+        raw_progress = drawn_in_region / max(1, ref_in_region)
+        progress = adjusted_progress_for_stage(step, raw_progress, stage_info)
         overlap = int(np.logical_and(snap_region, ref_region).sum()) / max(1, drawn_in_region)
         region_weight = min(1.0, ref_in_region / max(1, int(ref_mask.sum()) * 0.04))
         # Map the whole drawing into reference space so position/scale on canvas does not dominate.
         score = density * 2.2 + min(progress, 1.4) * 0.75 + overlap * 0.55 + region_weight * 0.2
+        if stage_info.get("lineOnly") and is_post_line_step(step):
+            score -= 1.25
         if is_focused_detail_step(step):
             score -= 0.12
         if step_number > 18:
@@ -748,7 +754,7 @@ def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None):
         step = first_drawing_step(guide)
         return build_live_response(project, guide, step, 0.0, active_bbox, "Start drawing on a paint layer. The coach will map your marks to the reference.", [], segments=[])
 
-    segments = build_live_segments(project, guide, scored, focus_step, mapped_active_bbox, active_bbox, ref_bbox, reference.size, live_overlay_dir)
+    segments = build_live_segments(project, guide, scored, focus_step, mapped_active_bbox, active_bbox, ref_bbox, reference.size, live_overlay_dir, live_visual_dir, reference, snapshot, stage_info)
 
     best = None
     if focus_step is not None:
@@ -756,9 +762,10 @@ def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None):
     if best is None:
         best = scored[0]
     score, progress, density, overlap, step, region, drawn, ref_count = best
-    comments = make_live_comments(step, region, mapped_active_bbox, progress, density, overlap, drawn, ref_count)
+    comments = make_live_comments(step, region, mapped_active_bbox, progress, density, overlap, drawn, ref_count, stage_info)
     next_step = suggest_next_step(guide, int(step.get("step", 1)), progress)
     live_overlay = render_transformed_live_overlay(project, live_overlay_dir, int(step.get("step", 1)), ref_bbox, active_bbox, reference.size)
+    visual = render_live_visual(live_visual_dir, step, region, reference, snapshot, ref_bbox, active_bbox, stage_info)
     return build_live_response(
         project,
         guide,
@@ -770,12 +777,14 @@ def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None):
         next_step=next_step,
         score=score,
         live_overlay_path=live_overlay,
+        visual_path=visual,
         segments=segments,
         alignment={"referenceBbox": ref_bbox, "drawingBbox": active_bbox, "mappedDrawingBbox": mapped_active_bbox},
+        stage_info=stage_info,
     )
 
 
-def build_live_segments(project, guide, scored, focus_step, mapped_active_bbox, active_bbox, ref_bbox, reference_size, live_overlay_dir):
+def build_live_segments(project, guide, scored, focus_step, mapped_active_bbox, active_bbox, ref_bbox, reference_size, live_overlay_dir, live_visual_dir, reference, snapshot, stage_info):
     segments = []
     seen_detail_regions = set()
     broad_count = 0
@@ -787,6 +796,8 @@ def build_live_segments(project, guide, scored, focus_step, mapped_active_bbox, 
             return False
         score, progress, density, overlap, step, region, drawn, ref_count = item
         step_number = int(step.get("step", 1))
+        if stage_info.get("lineOnly") and is_post_line_step(step) and not force:
+            return False
         if drawn < 25 and ref_count < 80 and len(segments) >= 6 and not force:
             return False
         area_ratio = (region["w"] * region["h"]) / max(1, reference_size[0] * reference_size[1])
@@ -799,9 +810,10 @@ def build_live_segments(project, guide, scored, focus_step, mapped_active_bbox, 
             seen_detail_regions.add(key)
         if area_ratio > 0.35:
             broad_count += 1
-        comments = make_live_comments(step, region, mapped_active_bbox, progress, density, overlap, drawn, ref_count)
+        comments = make_live_comments(step, region, mapped_active_bbox, progress, density, overlap, drawn, ref_count, stage_info)
         live_overlay = render_transformed_live_overlay(project, live_overlay_dir, step_number, ref_bbox, active_bbox, reference_size)
-        segments.append(segment_response(project, guide, step, progress, active_bbox, comments, score, live_overlay))
+        visual = render_live_visual(live_visual_dir, step, region, reference, snapshot, ref_bbox, active_bbox, stage_info)
+        segments.append(segment_response(project, guide, step, progress, active_bbox, comments, score, live_overlay, visual))
         return True
 
     if focus_step is not None:
@@ -832,6 +844,59 @@ def is_live_prep_step(step):
 
 def is_focused_detail_step(step):
     return str(step.get("title", "")).lower().startswith("focused detail pass")
+
+
+def is_post_line_step(step):
+    text = (str(step.get("title", "")) + " " + str(step.get("layer", ""))).lower()
+    post_line_terms = [
+        "flat color",
+        "flats",
+        "shadow",
+        "highlight",
+        "texture",
+        "focused detail pass",
+        "final check",
+    ]
+    return any(term in text for term in post_line_terms)
+
+
+def classify_live_stage(arr, mask, bg_rgb):
+    count = int(mask.sum())
+    if count <= 0:
+        return {
+            "stage": "blank",
+            "lineOnly": False,
+            "drawnPixels": 0,
+            "coloredRatio": 0.0,
+            "darkRatio": 0.0,
+        }
+    pixels = arr[mask].astype(np.int16)
+    maxc = pixels.max(axis=1)
+    minc = pixels.min(axis=1)
+    chroma = maxc - minc
+    luminance = (pixels[:, 0] * 0.299 + pixels[:, 1] * 0.587 + pixels[:, 2] * 0.114)
+    bg = np.array(bg_rgb, dtype=np.int16)
+    distance = np.linalg.norm(pixels - bg, axis=1)
+
+    colored = (chroma > 28) & (luminance > 45) & (distance > 55)
+    dark = luminance < 95
+    colored_ratio = float(colored.sum() / max(1, count))
+    dark_ratio = float(dark.sum() / max(1, count))
+    line_only = colored_ratio < 0.035 and dark_ratio > 0.55
+    stage = "lineart-only" if line_only else ("color-or-shading" if colored_ratio >= 0.035 else "mixed-monochrome")
+    return {
+        "stage": stage,
+        "lineOnly": bool(line_only),
+        "drawnPixels": count,
+        "coloredRatio": round(colored_ratio, 4),
+        "darkRatio": round(dark_ratio, 4),
+    }
+
+
+def adjusted_progress_for_stage(step, raw_progress, stage_info):
+    if stage_info.get("lineOnly") and is_post_line_step(step):
+        return 0.0
+    return raw_progress
 
 
 def region_signature(region):
@@ -889,6 +954,79 @@ def render_transformed_live_overlay(project, live_overlay_dir, step_number, ref_
         return str(source)
 
 
+def render_live_visual(live_visual_dir, step, region, reference, snapshot, ref_bbox, active_bbox, stage_info):
+    step_number = int(step.get("step", 1))
+    output = live_visual_dir / f"compare_step_{step_number:03d}.png"
+    try:
+        focus = pad_region(region, reference.width, reference.height, 36)
+        user_focus = reference_region_to_user_region(focus, ref_bbox, active_bbox, snapshot.width, snapshot.height)
+        ref_crop = reference.crop((focus["x"], focus["y"], focus["x"] + focus["w"], focus["y"] + focus["h"]))
+        user_crop = snapshot.crop((user_focus["x"], user_focus["y"], user_focus["x"] + user_focus["w"], user_focus["y"] + user_focus["h"]))
+
+        card_w, card_h = 980, 560
+        panel_w, panel_h = 440, 380
+        bg = Image.new("RGB", (card_w, card_h), (247, 248, 246))
+        draw = ImageDraw.Draw(bg)
+        title_font = load_font(24, bold=True)
+        label_font = load_font(18, bold=True)
+        small_font = load_font(15)
+        border = hex_to_rgb(step.get("color", "#0B7DFF"))
+
+        title = f"Step {step_number}: {truncate(step.get('title', ''), 44)}"
+        draw.text((24, 20), title, font=title_font, fill=(18, 24, 28))
+        if stage_info.get("lineOnly") and is_post_line_step(step):
+            note = "Lineart-only detected: this color/detail step waits for real fill or shading."
+        elif stage_info.get("lineOnly"):
+            note = "Lineart-only detected: compare big silhouette and clean outline placement."
+        else:
+            note = "Compare the same focused section: target on left, your current marks on right."
+        draw.text((24, 54), note, font=small_font, fill=(74, 82, 88))
+
+        draw.text((24, 92), "Reference section", font=label_font, fill=(38, 44, 50))
+        draw.text((516, 92), "Your drawing", font=label_font, fill=(38, 44, 50))
+        paste_fitted(bg, ref_crop, (24, 124, panel_w, panel_h), border)
+        paste_fitted(bg, user_crop, (516, 124, panel_w, panel_h), (35, 35, 35))
+
+        draw.text((24, 518), f"Reference region: x {region['x']} y {region['y']} w {region['w']} h {region['h']}", font=small_font, fill=(74, 82, 88))
+        draw.text((516, 518), "This preview ignores the live overlay layer.", font=small_font, fill=(74, 82, 88))
+        bg.save(output)
+        return str(output)
+    except Exception:
+        return ""
+
+
+def pad_region(region, width, height, pad):
+    x = max(0, int(region.get("x", 0)) - pad)
+    y = max(0, int(region.get("y", 0)) - pad)
+    x2 = min(width, int(region.get("x", 0)) + int(region.get("w", width)) + pad)
+    y2 = min(height, int(region.get("y", 0)) + int(region.get("h", height)) + pad)
+    return {"x": x, "y": y, "w": max(1, x2 - x), "h": max(1, y2 - y)}
+
+
+def reference_region_to_user_region(region, ref_bbox, active_bbox, width, height):
+    rx, ry, rw, rh = ref_bbox["x"], ref_bbox["y"], max(1, ref_bbox["w"]), max(1, ref_bbox["h"])
+    ax, ay, aw, ah = active_bbox["x"], active_bbox["y"], max(1, active_bbox["w"]), max(1, active_bbox["h"])
+    x = ax + (region["x"] - rx) / rw * aw
+    y = ay + (region["y"] - ry) / rh * ah
+    w = region["w"] / rw * aw
+    h = region["h"] / rh * ah
+    return clamp_rect(int(round(x)), int(round(y)), int(round(w)), int(round(h)), width, height)
+
+
+def paste_fitted(canvas, image, box, border):
+    x, y, w, h = box
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle([x, y, x + w, y + h], fill=(255, 255, 255), outline=(120, 126, 130), width=1)
+    fitted = image.convert("RGB")
+    max_w, max_h = max(1, w - 18), max(1, h - 18)
+    scale = min(max_w / max(1, fitted.width), max_h / max(1, fitted.height))
+    fitted = fitted.resize((max(1, int(fitted.width * scale)), max(1, int(fitted.height * scale))), Image.LANCZOS)
+    px = x + (w - fitted.width) // 2
+    py = y + (h - fitted.height) // 2
+    canvas.paste(fitted, (px, py))
+    draw.rectangle([px, py, px + fitted.width, py + fitted.height], outline=border, width=4)
+
+
 def find_live_project(artworks_root, project_id):
     if project_id:
         candidate = artworks_root / project_id
@@ -919,10 +1057,14 @@ def clamp_rect_dict(region, width, height):
     return clamp_rect(region.get("x", 0), region.get("y", 0), region.get("w", width), region.get("h", height), width, height)
 
 
-def make_live_comments(step, region, active_bbox, progress, density, overlap, drawn, ref_count):
+def make_live_comments(step, region, active_bbox, progress, density, overlap, drawn, ref_count, stage_info=None):
     title = step.get("title", f"Step {step.get('step', '?')}")
     comments = []
     comments.append(f"Detected current focus: Step {step.get('step')}: {title}.")
+    if stage_info and stage_info.get("lineOnly") and is_post_line_step(step):
+        comments.append("Your current capture looks like lineart only, so this color/shadow/detail step is not counted as done yet.")
+        comments.append("Finish the rough/clean outline first, then this step will start progressing when you add real fill color or shading.")
+        return comments
     if progress < 0.12:
         comments.append("Very early in this area: block the biggest shape first before adding texture.")
     elif progress < 0.45:
@@ -956,10 +1098,11 @@ def suggest_next_step(guide, step_number, progress):
     return min(len(steps), step_number + 1)
 
 
-def segment_response(project, guide, step, progress, active_bbox, comments, score, live_overlay_path):
+def segment_response(project, guide, step, progress, active_bbox, comments, score, live_overlay_path, visual_path=""):
     step_number = int(step.get("step", 1))
     overlay = project / "overlays" / f"step_{step_number:03d}.png"
     card = project / "steps" / f"step_{step_number:03d}_card.png"
+    reference = project / "reference.png"
     return {
         "step": step_number,
         "stepTitle": step.get("title", f"Step {step_number}"),
@@ -976,6 +1119,8 @@ def segment_response(project, guide, step, progress, active_bbox, comments, scor
         "comments": comments,
         "overlayPath": str(overlay) if overlay.exists() else "",
         "liveOverlayPath": live_overlay_path,
+        "visualPath": visual_path,
+        "referencePath": str(reference) if reference.exists() else "",
         "cardPath": str(card) if card.exists() else "",
         "instruction": step.get("instruction", ""),
         "checkpoint": step.get("checkpoint", ""),
@@ -983,8 +1128,8 @@ def segment_response(project, guide, step, progress, active_bbox, comments, scor
     }
 
 
-def build_live_response(project, guide, step, progress, active_bbox, message, comments, next_step=None, score=0.0, live_overlay_path="", segments=None, alignment=None):
-    segment = segment_response(project, guide, step, progress, active_bbox, comments, score, live_overlay_path)
+def build_live_response(project, guide, step, progress, active_bbox, message, comments, next_step=None, score=0.0, live_overlay_path="", visual_path="", segments=None, alignment=None, stage_info=None):
+    segment = segment_response(project, guide, step, progress, active_bbox, comments, score, live_overlay_path, visual_path)
     segment.update({
         "status": "ok",
         "projectId": project.name,
@@ -992,6 +1137,7 @@ def build_live_response(project, guide, step, progress, active_bbox, message, co
         "recommendedStep": next_step or segment["step"],
         "alignment": alignment or {},
         "segments": segments or [],
+        "stageInfo": stage_info or {},
     })
     segment["message"] = message
     return segment

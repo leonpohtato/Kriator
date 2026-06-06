@@ -67,3 +67,5 @@ Restart Krita, enable `Krita Guide Live Coach` in `Settings > Configure Krita > 
 The docker captures the active document every few seconds, hides its own overlay before capture, and analyzes your whole drawing against the reference. It maps your marks to the reference even if your sketch is shifted or scaled on the canvas.
 
 The segment list shows clickable comments for likely matching sections. Click a segment to lock focus there while you keep tweaking it; the comments and overlay keep updating for that same section. Press `Follow detected` to return to automatic section following.
+
+The docker also has a `Visual compare` mode. For the selected segment it shows a side-by-side preview: the matching reference section on the left and your current drawing crop on the right. During lineart-only captures, flat-color, shadow, highlight, and detail steps are not counted as complete just because an outline crosses that region.

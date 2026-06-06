@@ -6,7 +6,8 @@ import time
 import urllib.request
 
 from krita import DockWidget, DockWidgetFactory, DockWidgetFactoryBase, InfoObject, Krita
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -66,8 +67,11 @@ class KritaGuideLiveDocker(DockWidget):
         self.auto_overlay.setChecked(True)
         self.auto_advance = QCheckBox("Auto follow step")
         self.auto_advance.setChecked(True)
+        self.visual_compare = QCheckBox("Visual compare")
+        self.visual_compare.setChecked(True)
         row2.addWidget(self.auto_overlay)
         row2.addWidget(self.auto_advance)
+        row2.addWidget(self.visual_compare)
         layout.addLayout(row2)
 
         row3 = QHBoxLayout()
@@ -83,6 +87,13 @@ class KritaGuideLiveDocker(DockWidget):
         self.step_label = QLabel("Step: -")
         self.step_label.setWordWrap(True)
         layout.addWidget(self.step_label)
+
+        self.visual_label = QLabel("Visual comparison appears after analysis.")
+        self.visual_label.setWordWrap(True)
+        self.visual_label.setAlignment(Qt.AlignCenter)
+        self.visual_label.setMinimumHeight(170)
+        self.visual_label.setStyleSheet("QLabel { background: #202428; color: #d9dee3; border: 1px solid #535a60; }")
+        layout.addWidget(self.visual_label)
 
         self.segment_label = QLabel("Segments: analyze the canvas to populate clickable comments.")
         self.segment_label.setWordWrap(True)
@@ -146,7 +157,7 @@ class KritaGuideLiveDocker(DockWidget):
     def export_clean_snapshot(self, doc):
         hidden_nodes = []
         for node in self.walk_nodes(doc.rootNode()):
-            if node.name().startswith("KGA "):
+            if self.hide_for_capture(node):
                 if node.visible():
                     node.setVisible(False)
                     hidden_nodes.append(node)
@@ -158,6 +169,16 @@ class KritaGuideLiveDocker(DockWidget):
             node.setVisible(True)
         doc.refreshProjection()
         return path
+
+    def hide_for_capture(self, node):
+        name = node.name().strip().lower()
+        if name.startswith("kga "):
+            return True
+        if name.startswith("guide overlay"):
+            return True
+        if "reference" in name:
+            return True
+        return False
 
     def post_snapshot(self, snapshot_path):
         with open(snapshot_path, "rb") as handle:
@@ -234,10 +255,29 @@ class KritaGuideLiveDocker(DockWidget):
             "Common mistake: " + str(result.get("commonMistake", "")),
         ]
         self.feedback.setPlainText("\n".join(details))
+        self.update_visual_preview(result)
         if self.auto_overlay.isChecked():
             overlay = result.get("liveOverlayPath") or result.get("overlayPath")
             if overlay:
                 self.ensure_overlay_layer(doc, overlay)
+
+    def update_visual_preview(self, result):
+        if not self.visual_compare.isChecked():
+            self.visual_label.setText("Visual compare is off.")
+            self.visual_label.setPixmap(QPixmap())
+            return
+        visual_path = result.get("visualPath") or result.get("cardPath")
+        if not visual_path or not os.path.exists(visual_path):
+            self.visual_label.setText("No visual comparison available for this section yet.")
+            self.visual_label.setPixmap(QPixmap())
+            return
+        pixmap = QPixmap(visual_path)
+        if pixmap.isNull():
+            self.visual_label.setText("Could not load visual comparison image.")
+            return
+        width = max(260, self.visual_label.width() - 12)
+        scaled = pixmap.scaled(width, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.visual_label.setPixmap(scaled)
 
     def render_segment_buttons(self):
         while self.segment_layout.count():
