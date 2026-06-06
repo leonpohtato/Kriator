@@ -40,6 +40,10 @@ def main():
         if len(sys.argv) != 4:
             fail("usage: zip <artwork_dir> <zip_path>")
         result = zip_artwork(Path(sys.argv[2]), Path(sys.argv[3]))
+    elif command == "live-feedback":
+        if len(sys.argv) != 5:
+            fail("usage: live-feedback <artworks_root> <snapshot_path> <project_id_or_empty>")
+        result = live_feedback(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])
     else:
         fail(f"unknown command: {command}")
     print(json.dumps(result, ensure_ascii=True))
@@ -658,6 +662,162 @@ def zip_artwork(art_dir, zip_path):
                     continue
                 archive.write(path, path.relative_to(art_dir))
     return {"zip": str(zip_path), "bytes": zip_path.stat().st_size}
+
+
+def live_feedback(artworks_root, snapshot_path, project_id):
+    project = find_live_project(artworks_root, project_id)
+    if not project:
+        return {
+            "status": "no_project",
+            "message": "No ready guide project found. Generate a guide in the web app first.",
+        }
+    guide_path = project / "guide.json"
+    analysis_path = project / "analysis.json"
+    reference_path = project / "reference.png"
+    if not guide_path.exists() or not reference_path.exists():
+        return {
+            "status": "project_not_ready",
+            "projectId": project.name,
+            "message": "The selected project is missing guide.json or reference.png.",
+        }
+
+    guide = json.loads(guide_path.read_text(encoding="utf-8"))
+    analysis = json.loads(analysis_path.read_text(encoding="utf-8")) if analysis_path.exists() else {}
+    snapshot = Image.open(snapshot_path).convert("RGB")
+    reference = Image.open(reference_path).convert("RGB")
+    if snapshot.size != reference.size:
+        snapshot = snapshot.resize(reference.size, Image.LANCZOS)
+
+    snap_arr = np.array(snapshot)
+    ref_arr = np.array(reference)
+    snap_bg = estimate_background(snap_arr)
+    snap_mask = np.linalg.norm(snap_arr.astype(np.int16) - np.array(snap_bg, dtype=np.int16), axis=2) > 34
+    ref_bg = tuple(hex_to_rgb(analysis.get("background", "#FFFFFF"))) if analysis.get("background") else estimate_background(ref_arr)
+    ref_mask = np.linalg.norm(ref_arr.astype(np.int16) - np.array(ref_bg, dtype=np.int16), axis=2) > 24
+    snap_mask = clean_mask(snap_mask)
+    ref_mask = clean_mask(ref_mask)
+
+    active_bbox = bbox_from_mask(snap_mask, reference.width, reference.height, pad=8)
+    total_drawn = int(snap_mask.sum())
+    if total_drawn < 80:
+        step = guide["steps"][0]
+        return build_live_response(project, guide, step, 0.0, active_bbox, "Start with the first guide step. Your canvas is still almost blank.", [])
+
+    scored = []
+    for step in guide.get("steps", []):
+        region = clamp_rect_dict(step.get("region", guide.get("canvas", {})), reference.width, reference.height)
+        x, y, w, h = region["x"], region["y"], region["w"], region["h"]
+        snap_region = snap_mask[y:y + h, x:x + w]
+        ref_region = ref_mask[y:y + h, x:x + w]
+        drawn_in_region = int(snap_region.sum())
+        ref_in_region = int(ref_region.sum())
+        density = drawn_in_region / max(1, w * h)
+        progress = drawn_in_region / max(1, ref_in_region)
+        overlap = int(np.logical_and(snap_region, ref_region).sum()) / max(1, drawn_in_region)
+        # Favor the area the user is actively drawing, then progress against reference structure.
+        score = density * 3.0 + min(progress, 1.4) * 0.55 + overlap * 0.35
+        scored.append((score, progress, density, overlap, step, region, drawn_in_region, ref_in_region))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best = scored[0]
+    score, progress, density, overlap, step, region, drawn, ref_count = best
+    comments = make_live_comments(step, region, active_bbox, progress, density, overlap, drawn, ref_count)
+    next_step = suggest_next_step(guide, int(step.get("step", 1)), progress)
+    return build_live_response(project, guide, step, progress, active_bbox, comments[0], comments, next_step=next_step, score=score)
+
+
+def find_live_project(artworks_root, project_id):
+    if project_id:
+        candidate = artworks_root / project_id
+        return candidate if candidate.exists() else None
+    candidates = []
+    if not artworks_root.exists():
+        return None
+    for child in artworks_root.iterdir():
+        if not child.is_dir():
+            continue
+        meta_path = child / "meta.json"
+        guide_path = child / "guide.json"
+        if not guide_path.exists():
+            continue
+        status = "ready"
+        try:
+            if meta_path.exists():
+                status = json.loads(meta_path.read_text(encoding="utf-8")).get("status", "ready")
+        except Exception:
+            pass
+        if status == "ready":
+            candidates.append(child)
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def clamp_rect_dict(region, width, height):
+    return clamp_rect(region.get("x", 0), region.get("y", 0), region.get("w", width), region.get("h", height), width, height)
+
+
+def make_live_comments(step, region, active_bbox, progress, density, overlap, drawn, ref_count):
+    title = step.get("title", f"Step {step.get('step', '?')}")
+    comments = []
+    comments.append(f"Detected current focus: Step {step.get('step')}: {title}.")
+    if progress < 0.12:
+        comments.append("Very early in this area: block the biggest shape first before adding texture.")
+    elif progress < 0.45:
+        comments.append("Good start: keep building the main edges and proportions in the highlighted region.")
+    elif progress < 0.85:
+        comments.append("This region is partly built: compare the silhouette and major inner lines before moving on.")
+    else:
+        comments.append("This step looks substantially covered. You can refine edges or let the coach advance.")
+
+    rx, ry = region["x"] + region["w"] / 2, region["y"] + region["h"] / 2
+    ax, ay = active_bbox["x"] + active_bbox["w"] / 2, active_bbox["y"] + active_bbox["h"] / 2
+    dx, dy = ax - rx, ay - ry
+    if abs(dx) > region["w"] * 0.35:
+        comments.append("Your active marks are drifting horizontally from this step area; check placement against the overlay.")
+    if abs(dy) > region["h"] * 0.35:
+        comments.append("Your active marks are drifting vertically from this step area; zoom out and compare height.")
+    if overlap < 0.18 and drawn > 250:
+        comments.append("The marks do not overlap much with the reference structure yet; use the overlay to re-anchor the main contour.")
+    if density > 0.23 and progress < 0.4:
+        comments.append("This area is getting dense before the reference shape is covered. Use fewer, bigger strokes.")
+    return comments
+
+
+def suggest_next_step(guide, step_number, progress):
+    steps = guide.get("steps", [])
+    if progress < 0.85:
+        return step_number
+    return min(len(steps), step_number + 1)
+
+
+def build_live_response(project, guide, step, progress, active_bbox, message, comments, next_step=None, score=0.0):
+    step_number = int(step.get("step", 1))
+    overlay = project / "overlays" / f"step_{step_number:03d}.png"
+    card = project / "steps" / f"step_{step_number:03d}_card.png"
+    return {
+        "status": "ok",
+        "projectId": project.name,
+        "title": guide.get("title", "Krita Guide"),
+        "step": step_number,
+        "recommendedStep": next_step or step_number,
+        "stepTitle": step.get("title", f"Step {step_number}"),
+        "layer": step.get("layer", ""),
+        "brush": step.get("brush", ""),
+        "brushSizePx": step.get("brushSizePx", 0),
+        "opacity": step.get("opacity", 100),
+        "color": step.get("color", "#050507"),
+        "region": step.get("region", guide.get("canvas", {})),
+        "activeBbox": active_bbox,
+        "progressPercent": round(max(0.0, min(progress * 100.0, 160.0)), 1),
+        "score": round(float(score), 5),
+        "message": message,
+        "comments": comments,
+        "overlayPath": str(overlay) if overlay.exists() else "",
+        "cardPath": str(card) if card.exists() else "",
+        "instruction": step.get("instruction", ""),
+        "checkpoint": step.get("checkpoint", ""),
+        "commonMistake": step.get("commonMistake", ""),
+    }
 
 
 def rgb_to_hex(rgb):

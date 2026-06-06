@@ -90,6 +90,16 @@ async function handle(req, res) {
     return sendJson(res, 200, { ok: true, artworks: await listArtworks() });
   }
 
+  if (method === "GET" && url.pathname === "/api/live/latest-project") {
+    const artworks = await listArtworks();
+    const ready = artworks.find((artwork) => artwork.status === "ready") || artworks[0] || null;
+    return sendJson(res, 200, { ok: true, artwork: ready });
+  }
+
+  if (method === "POST" && url.pathname === "/api/live/feedback") {
+    return liveFeedback(res, await readJsonBody(req));
+  }
+
   if (method === "POST" && url.pathname === "/api/artworks") {
     const body = await readJsonBody(req);
     return createArtwork(res, body);
@@ -172,6 +182,29 @@ async function createArtwork(res, body) {
   await pruneOldArtworks();
 
   sendJson(res, 200, { ok: true, artwork: await loadArtworkState(id) });
+}
+
+async function liveFeedback(res, body) {
+  const dataUrl = String(body.snapshotDataUrl || "");
+  const match = dataUrl.match(/^data:image\/png;base64,(.+)$/);
+  if (!match) {
+    return sendJson(res, 400, { ok: false, error: "snapshotDataUrl must be a PNG data URL." });
+  }
+
+  const projectId = body.projectId ? String(body.projectId) : "";
+  if (projectId) assertArtworkId(projectId);
+  const sessionId = String(body.sessionId || "krita-live").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  await fsp.mkdir(TMP_ROOT, { recursive: true });
+  const snapshotPath = path.join(TMP_ROOT, `${sessionId}-${Date.now()}.png`);
+  await fsp.writeFile(snapshotPath, Buffer.from(match[1], "base64"));
+
+  try {
+    const result = await runWorker(["live-feedback", ARTWORKS_ROOT, snapshotPath, projectId], { timeoutMs: 120000 });
+    const feedback = parseJsonMaybe(result.stdout);
+    return sendJson(res, 200, { ok: true, feedback });
+  } finally {
+    fsp.rm(snapshotPath, { force: true }).catch(() => {});
+  }
 }
 
 async function generateArtwork(res, id, body) {

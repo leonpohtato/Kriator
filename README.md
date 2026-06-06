@@ -53,3 +53,15 @@ C:\Program Files\Krita (x64)\bin\krita.exe
 ```
 
 Set `KRITA_PATH` in `.env` if your Krita install moves. The generated `krita\guide_loader.py` can be run from Krita's Scripter. If automatic file layers fail, manually import `reference.png` and the overlay PNGs.
+
+## Live Krita Coach
+
+For automatic overlay and feedback inside Krita, run:
+
+```text
+D:\data\krita-guide-agent\INSTALL_KRITA_LIVE_PLUGIN.cmd
+```
+
+Restart Krita, enable `Krita Guide Live Coach` in `Settings > Configure Krita > Python Plugin Manager`, restart Krita again, then open `Settings > Dockers > Krita Guide Live Coach`.
+
+The docker captures the active document every few seconds, hides its own overlay before capture, asks the local app which guide step matches the current drawing area, and replaces the live overlay layer automatically.
