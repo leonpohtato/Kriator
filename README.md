@@ -1,6 +1,23 @@
-# Krita Guide Agent
+# Kriator
 
-Local MVP for turning an uploaded artwork into a beginner Krita guide pack.
+Local MVP for turning an uploaded artwork into a beginner Krita guide pack with generated overlays, beginner instructions, and a live Krita coach docker.
+
+## Demo In 5 Minutes
+
+1. Start the local app:
+
+```powershell
+cd /d D:\data\krita-guide-agent\app
+npm start
+```
+
+2. Open `http://localhost:8788`.
+3. Upload a PNG/JPG/WEBP artwork, or a CLIP file if it contains a readable preview.
+4. Click `Generate guide`.
+5. Review the generated step guide, overlay images, palette, and Krita helper script.
+6. For live drawing feedback, run `D:\data\krita-guide-agent\INSTALL_KRITA_LIVE_PLUGIN.cmd`, restart Krita, enable the plugin, then open `Settings > Dockers > Krita Guide Live Coach`.
+
+The live coach can hide guide/reference layers during capture, map your current drawing to the reference even if it is shifted/scaled, show clickable section feedback, and display a side-by-side `Visual compare` preview for the selected region.
 
 ## Run
 
