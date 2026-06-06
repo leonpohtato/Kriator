@@ -185,7 +185,7 @@ class KritaGuideLiveDocker(DockWidget):
         self.busy = True
         try:
             snapshot = self.export_clean_snapshot(doc)
-            result = self.post_snapshot(snapshot)
+            result = self.post_snapshot(snapshot, doc)
             self.apply_feedback(doc, result)
         except Exception as exc:
             self.status.setText("Live coach error: " + str(exc))
@@ -218,10 +218,10 @@ class KritaGuideLiveDocker(DockWidget):
             return True
         return False
 
-    def post_snapshot(self, snapshot_path):
+    def post_snapshot(self, snapshot_path, doc):
         with open(snapshot_path, "rb") as handle:
             encoded = base64.b64encode(handle.read()).decode("ascii")
-        telemetry = self.drain_input_telemetry()
+        telemetry = self.drain_input_telemetry(doc)
         payload = {
             "sessionId": SESSION_ID,
             "projectId": self.project_input.text().strip(),
@@ -382,18 +382,92 @@ class KritaGuideLiveDocker(DockWidget):
         if len(self.input_events) > self.input_event_limit:
             self.input_events = self.input_events[-self.input_event_limit:]
 
-    def drain_input_telemetry(self):
+    def drain_input_telemetry(self, doc):
         events = self.input_events
         self.input_events = []
-        summary = self.summarize_input_events(events)
+        strokes = self.build_strokes(events)
+        context = self.collect_document_context(doc)
+        summary = self.summarize_input_events(events, strokes)
         self.last_input_summary = summary
         return {
-            "schema": "kriator-live-input-v1",
+            "schema": "kriator-live-input-v2",
             "events": events,
+            "strokes": strokes,
             "summary": summary,
+            "context": context,
         }
 
-    def summarize_input_events(self, events):
+    def build_strokes(self, events):
+        strokes = []
+        current = []
+        for item in events:
+            kind = item.get("kind", "")
+            starts = kind.endswith("_press")
+            ends = kind.endswith("_release")
+            active = bool(item.get("buttons")) or (item.get("pressure") is not None and float(item.get("pressure") or 0) > 0)
+            if starts or (active and not current):
+                if current:
+                    strokes.append(self.summarize_stroke(current))
+                current = [item]
+            elif current:
+                current.append(item)
+            elif active:
+                current = [item]
+            if ends and current:
+                strokes.append(self.summarize_stroke(current))
+                current = []
+        if current:
+            strokes.append(self.summarize_stroke(current))
+        return strokes[-80:]
+
+    def summarize_stroke(self, events):
+        pressure_values = [
+            float(item["pressure"]) for item in events
+            if item.get("pressure") is not None and float(item.get("pressure", 0)) > 0
+        ]
+        xs = [float(item.get("x")) for item in events if item.get("x") is not None]
+        ys = [float(item.get("y")) for item in events if item.get("y") is not None]
+        distance = 0.0
+        max_speed = 0.0
+        previous = None
+        for item in events:
+            x = item.get("x")
+            y = item.get("y")
+            t = item.get("t")
+            if x is None or y is None:
+                continue
+            point = (float(x), float(y), float(t or 0))
+            if previous is not None:
+                dx = point[0] - previous[0]
+                dy = point[1] - previous[1]
+                segment = (dx * dx + dy * dy) ** 0.5
+                distance += segment
+                dt = max(0.001, point[2] - previous[2])
+                max_speed = max(max_speed, segment / dt)
+            previous = point
+        duration = int((events[-1].get("t", 0) - events[0].get("t", 0)) * 1000) if len(events) >= 2 else 0
+        return {
+            "source": events[0].get("source", ""),
+            "startTime": events[0].get("t"),
+            "endTime": events[-1].get("t"),
+            "durationMs": max(0, duration),
+            "eventCount": len(events),
+            "distancePx": distance,
+            "avgSpeedPxPerSec": distance / max(0.001, duration / 1000.0) if duration else 0,
+            "maxSpeedPxPerSec": max_speed,
+            "bounds": {
+                "x": min(xs) if xs else None,
+                "y": min(ys) if ys else None,
+                "w": (max(xs) - min(xs)) if xs else None,
+                "h": (max(ys) - min(ys)) if ys else None,
+            },
+            "pressureSamples": len(pressure_values),
+            "avgPressure": sum(pressure_values) / len(pressure_values) if pressure_values else 0,
+            "minPressure": min(pressure_values) if pressure_values else 0,
+            "maxPressure": max(pressure_values) if pressure_values else 0,
+        }
+
+    def summarize_input_events(self, events, strokes):
         pressure_values = [
             float(item["pressure"]) for item in events
             if item.get("pressure") is not None and float(item.get("pressure", 0)) > 0
@@ -415,12 +489,87 @@ class KritaGuideLiveDocker(DockWidget):
             "eventCount": len(events),
             "tabletEvents": tablet_count,
             "mouseEvents": len(events) - tablet_count,
+            "strokeCount": len(strokes),
             "pressureSamples": len(pressure_values),
             "avgPressure": sum(pressure_values) / len(pressure_values) if pressure_values else 0,
             "maxPressure": max(pressure_values) if pressure_values else 0,
             "distancePx": distance,
+            "avgStrokeDistancePx": sum(stroke.get("distancePx", 0) for stroke in strokes) / len(strokes) if strokes else 0,
+            "maxStrokeSpeedPxPerSec": max([stroke.get("maxSpeedPxPerSec", 0) for stroke in strokes] or [0]),
             "durationMs": int((events[-1]["t"] - events[0]["t"]) * 1000) if len(events) >= 2 else 0,
         }
+
+    def collect_document_context(self, doc):
+        active = self.safe_call(doc, "activeNode")
+        active_info = self.node_info(active)
+        visible = {}
+        total_visible = 0
+        for node in self.walk_nodes(doc.rootNode()):
+            if node == doc.rootNode():
+                continue
+            try:
+                is_visible = bool(node.visible())
+            except Exception:
+                is_visible = False
+            if not is_visible:
+                continue
+            category = self.layer_category(node.name())
+            visible[category] = visible.get(category, 0) + 1
+            total_visible += 1
+        return {
+            "documentName": self.safe_call(doc, "name") or "",
+            "documentFileName": self.safe_call(doc, "fileName") or "",
+            "canvas": {
+                "width": self.safe_call(doc, "width"),
+                "height": self.safe_call(doc, "height"),
+            },
+            "activeLayer": active_info,
+            "activeCategory": active_info.get("category", "Other"),
+            "visibleCategoryCounts": visible,
+            "visibleLayerCount": total_visible,
+            "assessmentMode": "combined-visible-artwork",
+            "categoryAssessment": "Visible layers with matching beginner categories are assessed as one combined result.",
+        }
+
+    def node_info(self, node):
+        if node is None:
+            return {"name": "", "category": "Unknown"}
+        name = node.name()
+        return {
+            "name": name,
+            "category": self.layer_category(name),
+            "type": self.safe_call(node, "type") or "",
+            "visible": self.safe_call(node, "visible"),
+            "locked": self.safe_call(node, "locked"),
+            "opacity": self.safe_call(node, "opacity"),
+        }
+
+    def layer_category(self, name):
+        text = str(name or "").lower()
+        if text.startswith("kga ") or "guide overlay" in text or "reference" in text:
+            return "Guide/Reference"
+        if "rough" in text or "sketch" in text:
+            return "Rough Sketch"
+        if "line" in text or "ink" in text:
+            return "Lineart"
+        if "flat" in text or "color" in text or "colour" in text:
+            return "Flat Colors"
+        if "shadow" in text or "shade" in text:
+            return "Shadows"
+        if "highlight" in text or "texture" in text:
+            return "Highlights and Texture"
+        if "detail" in text:
+            return "Small Details"
+        return "Other"
+
+    def safe_call(self, obj, method):
+        try:
+            attr = getattr(obj, method, None)
+            if attr is None:
+                return None
+            return attr() if callable(attr) else attr
+        except Exception:
+            return None
 
     def event_position(self, event):
         for name in ("posF", "pos", "globalPosF", "globalPos"):

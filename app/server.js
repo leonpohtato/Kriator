@@ -265,12 +265,110 @@ function normalizeTelemetry(input) {
   return {
     schema: safeSmallString(source.schema, 80) || "kriator-live-input-v1",
     summary: summarizeTelemetry(events, source.summary),
-    events
+    events,
+    strokes: normalizeStrokes(source.strokes, events),
+    context: normalizeTelemetryContext(source.context)
+  };
+}
+
+function normalizeStrokes(input, events) {
+  const source = Array.isArray(input) && input.length ? input.slice(-100) : buildStrokesFromEvents(events);
+  return source.map((item) => {
+    const stroke = item && typeof item === "object" ? item : {};
+    const bounds = stroke.bounds && typeof stroke.bounds === "object" ? stroke.bounds : {};
+    return {
+      source: safeSmallString(stroke.source, 20),
+      startTime: finiteNumber(stroke.startTime),
+      endTime: finiteNumber(stroke.endTime),
+      durationMs: finiteNumber(stroke.durationMs) || 0,
+      eventCount: finiteNumber(stroke.eventCount) || 0,
+      distancePx: finiteNumber(stroke.distancePx) || 0,
+      avgSpeedPxPerSec: finiteNumber(stroke.avgSpeedPxPerSec) || 0,
+      maxSpeedPxPerSec: finiteNumber(stroke.maxSpeedPxPerSec) || 0,
+      bounds: {
+        x: finiteNumber(bounds.x),
+        y: finiteNumber(bounds.y),
+        w: finiteNumber(bounds.w),
+        h: finiteNumber(bounds.h)
+      },
+      pressureSamples: finiteNumber(stroke.pressureSamples) || 0,
+      avgPressure: finiteNumber(stroke.avgPressure) || 0,
+      minPressure: finiteNumber(stroke.minPressure) || 0,
+      maxPressure: finiteNumber(stroke.maxPressure) || 0
+    };
+  });
+}
+
+function buildStrokesFromEvents(events) {
+  const strokes = [];
+  let current = [];
+  for (const event of events) {
+    const kind = String(event.kind || "");
+    const starts = kind.endsWith("_press");
+    const ends = kind.endsWith("_release");
+    const active = Boolean(event.buttons) || (Number.isFinite(event.pressure) && event.pressure > 0);
+    if (starts || (active && !current.length)) {
+      if (current.length) strokes.push(summarizeStroke(current));
+      current = [event];
+    } else if (current.length) {
+      current.push(event);
+    } else if (active) {
+      current = [event];
+    }
+    if (ends && current.length) {
+      strokes.push(summarizeStroke(current));
+      current = [];
+    }
+  }
+  if (current.length) strokes.push(summarizeStroke(current));
+  return strokes.slice(-100);
+}
+
+function summarizeStroke(events) {
+  const pressures = events.map((event) => event.pressure).filter((value) => Number.isFinite(value) && value > 0);
+  const points = events.filter((event) => Number.isFinite(event.x) && Number.isFinite(event.y));
+  let distance = 0;
+  let maxSpeed = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const current = points[index];
+    const dx = current.x - previous.x;
+    const dy = current.y - previous.y;
+    const segment = Math.sqrt(dx * dx + dy * dy);
+    distance += segment;
+    const dt = Math.max(0.001, (current.t || 0) - (previous.t || 0));
+    maxSpeed = Math.max(maxSpeed, segment / dt);
+  }
+  const xs = points.map((event) => event.x);
+  const ys = points.map((event) => event.y);
+  const start = events[0] || {};
+  const end = events[events.length - 1] || {};
+  const durationMs = Number.isFinite(start.t) && Number.isFinite(end.t) ? Math.max(0, Math.round((end.t - start.t) * 1000)) : 0;
+  return {
+    source: start.source || "",
+    startTime: start.t ?? null,
+    endTime: end.t ?? null,
+    durationMs,
+    eventCount: events.length,
+    distancePx: distance,
+    avgSpeedPxPerSec: durationMs ? distance / Math.max(0.001, durationMs / 1000) : 0,
+    maxSpeedPxPerSec: maxSpeed,
+    bounds: {
+      x: xs.length ? Math.min(...xs) : null,
+      y: ys.length ? Math.min(...ys) : null,
+      w: xs.length ? Math.max(...xs) - Math.min(...xs) : null,
+      h: ys.length ? Math.max(...ys) - Math.min(...ys) : null
+    },
+    pressureSamples: pressures.length,
+    avgPressure: pressures.length ? pressures.reduce((sum, value) => sum + value, 0) / pressures.length : 0,
+    minPressure: pressures.length ? Math.min(...pressures) : 0,
+    maxPressure: pressures.length ? Math.max(...pressures) : 0
   };
 }
 
 function summarizeTelemetry(events, clientSummary = {}) {
   const pressures = events.map((event) => event.pressure).filter((value) => Number.isFinite(value) && value > 0);
+  const strokes = buildStrokesFromEvents(events);
   let distance = 0;
   let previous = null;
   for (const event of events) {
@@ -287,13 +385,52 @@ function summarizeTelemetry(events, clientSummary = {}) {
     eventCount: events.length,
     tabletEvents,
     mouseEvents: events.length - tabletEvents,
+    strokeCount: strokes.length,
     pressureSamples: pressures.length,
     avgPressure: pressures.length ? pressures.reduce((sum, value) => sum + value, 0) / pressures.length : 0,
     maxPressure: pressures.length ? Math.max(...pressures) : 0,
     distancePx: distance,
+    avgStrokeDistancePx: strokes.length ? strokes.reduce((sum, stroke) => sum + stroke.distancePx, 0) / strokes.length : 0,
+    maxStrokeSpeedPxPerSec: strokes.length ? Math.max(...strokes.map((stroke) => stroke.maxSpeedPxPerSec || 0)) : 0,
     durationMs: Number.isFinite(Number(clientSummary.durationMs)) ? Number(clientSummary.durationMs) : 0,
     pressureAvailable: pressures.length > 0
   };
+}
+
+function normalizeTelemetryContext(input) {
+  const source = input && typeof input === "object" ? input : {};
+  const canvas = source.canvas && typeof source.canvas === "object" ? source.canvas : {};
+  const activeLayer = source.activeLayer && typeof source.activeLayer === "object" ? source.activeLayer : {};
+  return {
+    documentName: safeSmallString(source.documentName, 120),
+    documentFileName: String(source.documentFileName || "").slice(0, 260),
+    canvas: {
+      width: finiteNumber(canvas.width),
+      height: finiteNumber(canvas.height)
+    },
+    activeLayer: {
+      name: String(activeLayer.name || "").slice(0, 120),
+      category: safeSmallString(activeLayer.category, 80),
+      type: safeSmallString(activeLayer.type, 80),
+      visible: Boolean(activeLayer.visible),
+      locked: Boolean(activeLayer.locked),
+      opacity: finiteNumber(activeLayer.opacity)
+    },
+    activeCategory: safeSmallString(source.activeCategory, 80),
+    visibleCategoryCounts: normalizeCategoryCounts(source.visibleCategoryCounts),
+    visibleLayerCount: finiteNumber(source.visibleLayerCount) || 0,
+    assessmentMode: safeSmallString(source.assessmentMode, 80),
+    categoryAssessment: String(source.categoryAssessment || "").slice(0, 220)
+  };
+}
+
+function normalizeCategoryCounts(input) {
+  const result = {};
+  if (!input || typeof input !== "object") return result;
+  for (const [key, value] of Object.entries(input)) {
+    result[safeSmallString(key, 80)] = finiteNumber(value) || 0;
+  }
+  return result;
 }
 
 function summarizeFeedback(feedback) {

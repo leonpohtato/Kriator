@@ -97,6 +97,8 @@ D:\data\krita-guide-agent\storage\artworks\<artwork-id>\live_sessions\<session-i
 
 Each record stores the current guide step, stage detection, feedback summary, visual-snapshot metrics, and app-wide tablet/mouse events that Krita/PyQt exposes during that interval. Pressure, tilt, and rotation are saved when the tablet event provides them. If Krita does not expose pressure for that event stream, the record explicitly shows `pressureAvailable: false` instead of guessing.
 
+Events are also grouped into stroke summaries with duration, distance, bounding box, speed, and pressure stats. The record includes the active Krita layer name plus a beginner category such as `Rough Sketch`, `Lineart`, `Flat Colors`, `Shadows`, or `Highlights and Texture`. Multiple visible layers in the same category are assessed as one combined visible result, so layers like `My Shadows 1`, `My Shadows 2`, and `Wing Shadows` can all contribute to the same shadow-stage assessment.
+
 Useful endpoints:
 
 - `GET /api/artworks/<artwork-id>/live-sessions`
