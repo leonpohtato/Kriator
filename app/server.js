@@ -216,11 +216,18 @@ async function liveFeedback(res, body) {
   const sessionId = String(body.sessionId || "krita-live").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
   const telemetry = normalizeTelemetry(body.telemetry);
   await fsp.mkdir(TMP_ROOT, { recursive: true });
-  const snapshotPath = path.join(TMP_ROOT, `${sessionId}-${Date.now()}.png`);
+  const liveStamp = Date.now();
+  const snapshotPath = path.join(TMP_ROOT, `${sessionId}-${liveStamp}.png`);
+  const contextPath = path.join(TMP_ROOT, `${sessionId}-${liveStamp}-context.json`);
   await fsp.writeFile(snapshotPath, Buffer.from(match[1], "base64"));
+  await fsp.writeFile(contextPath, JSON.stringify({
+    telemetryContext: telemetry.context,
+    telemetrySummary: telemetry.summary,
+    capabilityMatrix: telemetry.capabilityMatrix
+  }), "utf8");
 
   try {
-    const args = ["live-feedback", ARTWORKS_ROOT, snapshotPath, projectId];
+    const args = ["live-feedback", ARTWORKS_ROOT, snapshotPath, projectId, contextPath];
     if (focusStep) args.push(focusStep);
     const result = await runWorker(args, { timeoutMs: 120000 });
     const feedback = parseJsonMaybe(result.stdout);
@@ -236,6 +243,7 @@ async function liveFeedback(res, body) {
     return sendJson(res, 200, { ok: true, feedback });
   } finally {
     fsp.rm(snapshotPath, { force: true }).catch(() => {});
+    fsp.rm(contextPath, { force: true }).catch(() => {});
   }
 }
 

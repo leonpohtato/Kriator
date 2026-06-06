@@ -41,10 +41,19 @@ def main():
             fail("usage: zip <artwork_dir> <zip_path>")
         result = zip_artwork(Path(sys.argv[2]), Path(sys.argv[3]))
     elif command == "live-feedback":
-        if len(sys.argv) not in (5, 6):
-            fail("usage: live-feedback <artworks_root> <snapshot_path> <project_id_or_empty> [focus_step]")
-        focus_step = int(sys.argv[5]) if len(sys.argv) == 6 and str(sys.argv[5]).strip() else None
-        result = live_feedback(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], focus_step)
+        if len(sys.argv) not in (5, 6, 7):
+            fail("usage: live-feedback <artworks_root> <snapshot_path> <project_id_or_empty> [context_json] [focus_step]")
+        context_path = None
+        focus_step = None
+        if len(sys.argv) >= 6 and str(sys.argv[5]).strip():
+            candidate = Path(sys.argv[5])
+            if candidate.exists():
+                context_path = candidate
+            else:
+                focus_step = int(sys.argv[5])
+        if len(sys.argv) == 7 and str(sys.argv[6]).strip():
+            focus_step = int(sys.argv[6])
+        result = live_feedback(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], focus_step, context_path)
     else:
         fail(f"unknown command: {command}")
     print(json.dumps(result, ensure_ascii=True))
@@ -665,7 +674,7 @@ def zip_artwork(art_dir, zip_path):
     return {"zip": str(zip_path), "bytes": zip_path.stat().st_size}
 
 
-def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None):
+def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None, context_path=None):
     project = find_live_project(artworks_root, project_id)
     if not project:
         return {
@@ -697,7 +706,8 @@ def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None):
     ref_mask = np.linalg.norm(ref_arr.astype(np.int16) - np.array(ref_bg, dtype=np.int16), axis=2) > 24
     snap_mask = clean_mask(snap_mask)
     ref_mask = clean_mask(ref_mask)
-    stage_info = classify_live_stage(snap_arr, snap_mask, snap_bg)
+    live_context = load_live_context(context_path)
+    stage_info = classify_live_stage(snap_arr, snap_mask, snap_bg, live_context)
 
     active_bbox = bbox_from_mask(snap_mask, reference.width, reference.height, pad=8)
     ref_bbox = analysis.get("fullBbox") or bbox_from_mask(ref_mask, reference.width, reference.height, pad=8)
@@ -731,8 +741,8 @@ def live_feedback(artworks_root, snapshot_path, project_id, focus_step=None):
         region_weight = min(1.0, ref_in_region / max(1, int(ref_mask.sum()) * 0.04))
         # Map the whole drawing into reference space so position/scale on canvas does not dominate.
         score = density * 2.2 + min(progress, 1.4) * 0.75 + overlap * 0.55 + region_weight * 0.2
-        if stage_info.get("lineOnly") and is_post_line_step(step):
-            score -= 1.25
+        if is_step_blocked_by_stage(step, stage_info):
+            score -= 3.0
         if is_focused_detail_step(step):
             score -= 0.12
         if step_number > 18:
@@ -796,7 +806,7 @@ def build_live_segments(project, guide, scored, focus_step, mapped_active_bbox, 
             return False
         score, progress, density, overlap, step, region, drawn, ref_count = item
         step_number = int(step.get("step", 1))
-        if stage_info.get("lineOnly") and is_post_line_step(step) and not force:
+        if is_step_blocked_by_stage(step, stage_info) and not force:
             return False
         if drawn < 25 and ref_count < 80 and len(segments) >= 6 and not force:
             return False
@@ -860,7 +870,73 @@ def is_post_line_step(step):
     return any(term in text for term in post_line_terms)
 
 
-def classify_live_stage(arr, mask, bg_rgb):
+def step_stage(step):
+    text = (str(step.get("title", "")) + " " + str(step.get("layer", ""))).lower()
+    if "canvas setup" in text or "place the reference" in text:
+        return "prep"
+    if "rough" in text or "sketch" in text or "block-in" in text or "structure" in text:
+        return "rough"
+    if "line" in text or "ink" in text:
+        return "line"
+    if "flat" in text or "color" in text or "colour" in text:
+        return "color"
+    if "shadow" in text or "shade" in text:
+        return "shadow"
+    if "highlight" in text or "texture" in text:
+        return "highlight"
+    if "detail" in text or "final check" in text:
+        return "detail"
+    return "other"
+
+
+def workflow_stage_from_context(context):
+    if not context:
+        return ""
+    telemetry_context = context.get("telemetryContext") or {}
+    active_category = str(telemetry_context.get("activeCategory") or "").lower()
+    active_layer = telemetry_context.get("activeLayer") or {}
+    layer_text = (str(active_layer.get("name") or "") + " " + str(active_layer.get("category") or "") + " " + active_category).lower()
+    visible = {str(k).lower(): v for k, v in (telemetry_context.get("visibleCategoryCounts") or {}).items()}
+    if "rough" in layer_text or "sketch" in layer_text:
+        return "rough"
+    if "lineart" in layer_text or "line" in layer_text or "ink" in layer_text:
+        return "line"
+    if "flat" in layer_text or "color" in layer_text or "colour" in layer_text:
+        return "color"
+    if "shadow" in layer_text or "shade" in layer_text:
+        return "shadow"
+    if "highlight" in layer_text or "texture" in layer_text or "detail" in layer_text:
+        return "detail"
+    if visible and any("rough" in key or "sketch" in key for key in visible) and not any(
+        ("flat" in key or "color" in key or "shadow" in key or "highlight" in key or "texture" in key or "detail" in key)
+        for key in visible
+    ):
+        return "rough"
+    return ""
+
+
+def is_step_blocked_by_stage(step, stage_info):
+    current = stage_info.get("workflowStage") or ""
+    target = step_stage(step)
+    if current == "rough" and target in {"color", "shadow", "highlight", "detail"}:
+        return True
+    if current == "line" and target in {"color", "shadow", "highlight", "detail"}:
+        return True
+    if stage_info.get("lineOnly") and target in {"color", "shadow", "highlight", "detail"}:
+        return True
+    return False
+
+
+def load_live_context(context_path):
+    if not context_path:
+        return {}
+    try:
+        return json.loads(Path(context_path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def classify_live_stage(arr, mask, bg_rgb, live_context=None):
     count = int(mask.sum())
     if count <= 0:
         return {
@@ -869,6 +945,8 @@ def classify_live_stage(arr, mask, bg_rgb):
             "drawnPixels": 0,
             "coloredRatio": 0.0,
             "darkRatio": 0.0,
+            "workflowStage": workflow_stage_from_context(live_context),
+            "activeCategory": ((live_context or {}).get("telemetryContext") or {}).get("activeCategory", ""),
         }
     pixels = arr[mask].astype(np.int16)
     maxc = pixels.max(axis=1)
@@ -882,11 +960,16 @@ def classify_live_stage(arr, mask, bg_rgb):
     dark = luminance < 95
     colored_ratio = float(colored.sum() / max(1, count))
     dark_ratio = float(dark.sum() / max(1, count))
+    workflow_stage = workflow_stage_from_context(live_context)
     line_only = colored_ratio < 0.035 and dark_ratio > 0.55
+    if workflow_stage in {"rough", "line"}:
+        line_only = True
     stage = "lineart-only" if line_only else ("color-or-shading" if colored_ratio >= 0.035 else "mixed-monochrome")
     return {
         "stage": stage,
         "lineOnly": bool(line_only),
+        "workflowStage": workflow_stage,
+        "activeCategory": ((live_context or {}).get("telemetryContext") or {}).get("activeCategory", ""),
         "drawnPixels": count,
         "coloredRatio": round(colored_ratio, 4),
         "darkRatio": round(dark_ratio, 4),
@@ -894,7 +977,7 @@ def classify_live_stage(arr, mask, bg_rgb):
 
 
 def adjusted_progress_for_stage(step, raw_progress, stage_info):
-    if stage_info.get("lineOnly") and is_post_line_step(step):
+    if is_step_blocked_by_stage(step, stage_info):
         return 0.0
     return raw_progress
 
@@ -1061,9 +1144,10 @@ def make_live_comments(step, region, active_bbox, progress, density, overlap, dr
     title = step.get("title", f"Step {step.get('step', '?')}")
     comments = []
     comments.append(f"Detected current focus: Step {step.get('step')}: {title}.")
-    if stage_info and stage_info.get("lineOnly") and is_post_line_step(step):
-        comments.append("Your current capture looks like lineart only, so this color/shadow/detail step is not counted as done yet.")
-        comments.append("Finish the rough/clean outline first, then this step will start progressing when you add real fill color or shading.")
+    if stage_info and is_step_blocked_by_stage(step, stage_info):
+        current = stage_info.get("workflowStage") or ("lineart-only" if stage_info.get("lineOnly") else "early drawing")
+        comments.append(f"Stage gate: Krita currently looks like {current}, so this later {step_stage(step)} step is forced to 0% for now.")
+        comments.append("Finish the rough sketch/clean lineart first. Color, shadow, texture, and final detail steps will only progress after you work on those layer categories.")
         return comments
     if progress < 0.12:
         comments.append("Very early in this area: block the biggest shape first before adding texture.")
